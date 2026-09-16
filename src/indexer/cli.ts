@@ -110,11 +110,35 @@ async function main(): Promise<number> {
   return result.truncated ? 0 : 0;
 }
 
+/**
+ * EXIT WITHOUT `process.exit()`.
+ *
+ * `process.exit(0)` here crashed the process on this machine with
+ *
+ *     Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+ *
+ * and exit code `3221226505` (0xC0000409) -- AFTER the run had finished and the rows were
+ * committed. So the data was always correct; what was broken was the exit STATUS, which is
+ * the part every caller and every CI job reads. A green run that reports failure gets
+ * treated as a failure, and the obvious response -- retrying -- would have re-run catch-up
+ * loops forever on a job that had already succeeded.
+ *
+ * The cause is that `process.exit()` terminates the process immediately, while `node:sqlite`
+ * (experimental in Node 24, backed by a native threadpool handle) is still tearing down.
+ * Forcing exit mid-teardown trips a libuv assertion. Setting `process.exitCode` instead
+ * lets the event loop drain on its own and the process exit normally, with the same status.
+ *
+ * Verified both ways: the crash reproduced with `process.exit(0)` and a plain script that
+ * only opens, writes, closes and returns exits 0. Setting `exitCode` makes this CLI exit 0
+ * too.
+ */
 main()
-  .then((code) => process.exit(code))
+  .then((code) => {
+    process.exitCode = code;
+  })
   .catch((err) => {
     console.error(`indexer failed: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
+    process.exitCode = 1;
   });
 
 export { REPO };

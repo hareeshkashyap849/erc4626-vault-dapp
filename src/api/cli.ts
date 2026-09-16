@@ -229,18 +229,30 @@ async function main(): Promise<number> {
   // A clean shutdown matters here for one reason: SQLite in WAL mode leaves its
   // `-wal` file behind if the process is killed, and the next reader has to recover
   // it. Closing the store checkpoints and removes it.
+  //
+  // `process.exitCode` rather than `process.exit()` -- the same fix as the indexer CLI, for
+  // the same reason. `process.exit()` while `node:sqlite`'s native handle is still tearing
+  // down trips `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` and the process dies
+  // with 0xC0000409 instead of 0. The indexer hit that on EVERY run; this server only hits it
+  // on shutdown, which is rarer and therefore easier to misread as "SIGINT is flaky".
+  //
+  // `done` guards against closing the store twice, which the two paths below would otherwise
+  // do whenever `server.close` finishes inside the 2-second window.
   const shutdown = (signal: string): void => {
     log.info(`${signal} received; closing the database and exiting`);
-    server.close(() => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
       store.close();
-      process.exit(0);
-    });
+      // Nothing is left running, so the event loop drains and the process exits with this
+      // status on its own.
+      process.exitCode = 0;
+    };
+    server.close(finish);
     // A keep-alive connection that never closes would hold the process open past the
     // point of usefulness.
-    setTimeout(() => {
-      store.close();
-      process.exit(0);
-    }, 2000).unref();
+    setTimeout(finish, 2000).unref();
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -253,11 +265,11 @@ async function main(): Promise<number> {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main()
     .then((code) => {
-      if (code !== 0) process.exit(code);
+      process.exitCode = code;
     })
     .catch((err) => {
       log.error('the API failed to start', err);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
 

@@ -30,6 +30,7 @@ const CHECKS = [
   { name: 'keccak and event decoding (against real logs)', file: 'test/decode.test.ts' },
   { name: 'storage: idempotence and reorg rollback', file: 'test/db.test.ts' },
   { name: 'share price arithmetic', file: 'test/price.test.ts' },
+  { name: 'candlestick aggregation and formatting', file: 'test/chart.test.ts' },
   { name: 'query API', file: 'test/api.test.ts' },
   { name: 'configuration and deployment record', file: 'test/config.test.ts' },
 ];
