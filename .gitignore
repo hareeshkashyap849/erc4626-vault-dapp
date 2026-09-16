@@ -18,6 +18,12 @@ data/*.sqlite-shm
 data/*.sqlite-journal
 !data/vault.sqlite
 
+# Scratch output. Anything written into data/ that is not the snapshot is disposable,
+# and a JSON file of a response captured while developing would be a second copy of
+# data the API already serves.
+data/*.json
+data/_*
+
 # Node
 node_modules/
 
