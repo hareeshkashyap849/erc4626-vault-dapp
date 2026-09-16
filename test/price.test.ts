@@ -78,13 +78,12 @@ function buggySharePrice({ totalAssets, totalSupply, assetDecimals, shareDecimal
  * so at the asset's 6 decimals the price is `1.099999`, one base unit below `1.1`. The
  * brief's own example output on its first page is `"1.099999"`, which is this number.
  *
- * The gap is the +1 in the numerator against the +10**12 in the denominator, and it
- * cannot be removed: an exhaustive search of every whole-unit pair up to 4000x4000
- * finds NO inputs whose price is exactly `"1.1"` at 6 decimals, because flooring to 6
- * decimals always lands one unit short near that ratio. `1.1` is the natural way to
- * describe the position in prose; `1.099999` is what the contract and this module
- * compute, and a test that asserted `1.1` would either fail or force the formula to be
- * "fixed" into something the chain does not do.
+ * The two are not in conflict, and the deployed vault shows why. A live run against the
+ * local chain indexes `A = 934924100`, `S = 849930996648200851546` and the same formula
+ * yields exactly 1100000 -- `"1.1"`. So the formula does produce 1.1, at ratios a
+ * fraction above it; at exactly 550/500 it lands one base unit short. Both facts are
+ * asserted below, because a test that only carried one of them would leave the reader
+ * unable to tell which of the two figures was wrong.
  *
  * So the assertion is the computed value, and the brief's figure is carried here beside
  * it rather than quietly dropped.
@@ -102,6 +101,35 @@ test('a vault holding 550 assets against 500 shares prices one share at 1.099999
   // rather than a suspicion.
   assert.notEqual(price, '1.1', '1.1 is the prose figure, not the arithmetic one');
   assert.equal(Number(price), Number('1.099999'));
+});
+
+/**
+ * @dev The other half of the 1.1 question, with numbers that came off the chain.
+ *
+ * These two totals were read from the deployed YieldVault by a live API run: they are
+ * the last snapshot the indexer held, with 934924100 of a 6-decimal asset against
+ * 849930996648200851546 shares. The same formula that returns 1.099999 for 550/500
+ * returns EXACTLY 1100000 here -- `"1.1"`, with no shortfall at all.
+ *
+ * That is what makes the brief's figure right and the 550/500 shortfall real at the
+ * same time: the ratio is a hair above 1.1, so the floor lands on it rather than one
+ * unit below. A vault whose assets and shares sit just either side of that line prices
+ * at 1.1 or at 1.099999 depending on which side it falls, and both are the contract's
+ * answer rather than a rounding choice made here.
+ */
+test('the deployed vault prices at exactly 1.1 at ratios just above it', () => {
+  const assets = '934924100';
+  const supply = '849930996648200851546';
+
+  assert.equal(priceOf(assets, supply), '1.1', 'the live deployment, where the floor lands on 1.1');
+  // The hidden precision, to show the two cases are the same arithmetic and not a
+  // special case: carried to 12 decimals this one is 1.100000004220..., above 1.1,
+  // where 550/500 is 1.099999999... below it.
+  assert.equal(
+    formatUnits(((BigInt(assets) + 1n) * 10n ** 18n * 10n ** 6n) / (BigInt(supply) + 10n ** 12n), 12),
+    '1.100000004220',
+    'the real row sits just above 1.1, which is why six decimals read as exactly 1.1',
+  );
 });
 
 test('the same vault in whole units rather than base units is the same price', () => {
