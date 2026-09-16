@@ -773,7 +773,7 @@ test('an unknown path is a 404 whose body lists the endpoints', async () => {
         assert.ok(Array.isArray(body.endpoints), 'the body lists what does exist');
         assert.deepEqual(
           body.endpoints.map((e: any) => e.path.split('?')[0]),
-          ['/api/status', '/api/price', '/api/events', '/api/summary'],
+          ['/api/status', '/api/price', '/api/candles', '/api/events', '/api/summary'],
           'every endpoint, and only the ones that exist',
         );
       }
@@ -781,7 +781,7 @@ test('an unknown path is a 404 whose body lists the endpoints', async () => {
       // The root is an index rather than a 404: it is the one path a person types.
       const root = await get(base, '/');
       assert.equal(root.status, 200);
-      assert.equal(root.body.endpoints.length, 4);
+      assert.equal(root.body.endpoints.length, 5);
     });
   } finally {
     store.close();

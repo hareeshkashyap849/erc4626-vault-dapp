@@ -35,6 +35,7 @@ import { createServer as createHttpServer, type IncomingMessage, type Server, ty
 
 import type { Store } from '../lib/db.ts';
 import { priceSeries, type PricePoint } from './price.ts';
+import { bucketsFor, formatCandles } from './chart.ts';
 
 /**
  * The event kinds the indexer models. `decode.ts` is the source of these names --
@@ -58,7 +59,23 @@ const isEventKind = (value: string): value is EventKind => (EVENT_KINDS as reado
 export const LIMITS = {
   price: { fallback: 500, max: 5000 },
   events: { fallback: 50, max: 500 },
+  /**
+   * Candles pull their own, larger, snapshot window and then bucket it.
+   *
+   * The window has to be larger than the candle count because a chart needs a span of
+   * time, not a count of rows: asking for 120 candles out of 500 blocks would give
+   * candles covering whatever the 500 blocks happened to span, which on a chain that
+   * mines on demand is a few seconds. So `limit` here means BLOCKS PULLED, and the
+   * candle count that comes back is whatever those blocks bucket into. The response
+   * says both, so a caller is never left guessing which one `limit` was.
+   */
+  candles: { fallback: 5000, max: 5000 },
 } as const;
+
+/** Snapshot window used when bucketing candles into OHLC. See `LIMITS.candles`. */
+export const CANDLE_DEFAULT_BUCKET_SECONDS = 10;
+export const CANDLE_MIN_BUCKET_SECONDS = 1;
+export const CANDLE_MAX_BUCKET_SECONDS = 86_400;
 
 /**
  * The endpoints, as data. The 404 body and the CLI's startup banner both come from
@@ -68,6 +85,7 @@ export const LIMITS = {
 export const ENDPOINTS: readonly { path: string; description: string }[] = [
   { path: '/api/status', description: 'chain, vault, indexed block range, and whether the index is stale' },
   { path: '/api/price?limit=N', description: `share price series, oldest first (default ${LIMITS.price.fallback}, max ${LIMITS.price.max})` },
+  { path: '/api/candles?bucket=SECONDS&limit=N', description: `OHLC candles for the price chart, oldest first (bucket default ${CANDLE_DEFAULT_BUCKET_SECONDS}s, max ${CANDLE_MAX_BUCKET_SECONDS}s; limit is BLOCKS PULLED, default ${LIMITS.candles.fallback})` },
   { path: '/api/events?limit=N&kind=Deposit|Withdraw|YieldReported&account=0x...', description: `recent vault events, newest first (default ${LIMITS.events.fallback}, max ${LIMITS.events.max})` },
   { path: '/api/summary', description: 'event counts and summed assets per kind, plus the first and last event block' },
 ];
@@ -159,7 +177,20 @@ function oneParam(params: URLSearchParams, name: string): string | undefined {
  * matters, because it is a perfectly valid JS number and would reach SQLite as a
  * LIMIT that means "everything".
  */
-function intParam(raw: string | undefined, name: string, { fallback, max }: { fallback: number; max: number }): number {
+function intParam(
+  raw: string | undefined,
+  name: string,
+  { fallback, max }: { fallback: number; max: number },
+  /**
+   * A floor, for parameters where zero is not "less" but "meaningless".
+   *
+   * `limit=0` is coherent -- ask for no rows, get none. `bucket=0` is not: there is no
+   * such thing as a zero-second candlestick, and clamping it up to the minimum would
+   * silently answer a different question. So a floor REJECTS rather than clamps, which
+   * is the opposite of what `max` does, and the difference is deliberate.
+   */
+  min = 0,
+): number {
   if (raw === undefined) return fallback;
 
   const text = raw.trim();
@@ -172,6 +203,9 @@ function intParam(raw: string | undefined, name: string, { fallback, max }: { fa
   }
   if (value < 0) {
     throw badRequest(`${name} must not be negative, got ${value}`);
+  }
+  if (value < min) {
+    throw badRequest(`${name} must be at least ${min}, got ${value}`);
   }
   // Clamped, not rejected: `?limit=100000` is a request this API cannot serve in
   // full, and answering it with the largest page it does serve is more useful than
@@ -337,6 +371,61 @@ function handleStatus(store: Store, config: ApiServerConfig, now: () => number):
     updatedAt: state ? new Date(state.updatedAt).toISOString() : null,
     staleSeconds,
     note: 'lagBlocks is measured against the chain head recorded at the last indexer run, not against the chain now.',
+  };
+}
+
+const CANDLE_NOTE =
+  'Candles are built from the SAME derived prices as /api/price, aggregated in exact integers in asset ' +
+  'base units -- no candle value passes through a float, so a high cannot be reported that the vault never ' +
+  'had. Buckets are aligned to the Unix epoch, so two overlapping queries agree about the candles they ' +
+  'share. `limit` here is BLOCKS PULLED, not candles returned: a chart needs a span of time, so the ' +
+  'candle count is whatever those blocks bucket into and is reported as `count`. Points whose price was ' +
+  'null (an empty vault) are counted in `skipped` and left out, never plotted at zero. A candle with ' +
+  '`points: 1` is a single block, which is normal on a chain that mines on demand.';
+
+/**
+ * OHLC candles, oldest first.
+ *
+ * The bucketing itself lives in `chart.ts` -- a module with no database, no clock and
+ * no HTTP in it -- for the same reason the price arithmetic does: a chart is where a
+ * wrong number looks entirely plausible, so the part worth checking is callable as a
+ * function.
+ */
+function handleCandles(store: Store, config: ApiServerConfig, params: URLSearchParams): unknown {
+  const limit = intParam(oneParam(params, 'limit'), 'limit', LIMITS.candles);
+  const bucketSeconds = intParam(
+    oneParam(params, 'bucket'),
+    'bucket',
+    { fallback: CANDLE_DEFAULT_BUCKET_SECONDS, max: CANDLE_MAX_BUCKET_SECONDS },
+    CANDLE_MIN_BUCKET_SECONDS,
+  );
+  const decimals = decimalsOf(config);
+
+  const raw = store.priceSeries(limit);
+  const points: PricePoint[] = priceSeries(raw, decimals);
+  const { candles, skipped } = bucketsFor(points, {
+    bucketSeconds,
+    assetDecimals: decimals.assetDecimals,
+  });
+  const formatted = formatCandles(candles, decimals.assetDecimals);
+
+  const state = store.getState();
+  const coverage = coverageOf(store, state?.startBlock ?? config.startBlock);
+
+  return {
+    candles: formatted,
+    decimals: { asset: decimals.assetDecimals, share: decimals.shareDecimals },
+    // Both counts, because `limit` means blocks here and a caller who assumed it meant
+    // candles would draw a chart with the wrong label on the axis.
+    count: formatted.length,
+    pointsPulled: points.length,
+    pointsSkipped: skipped,
+    bucketSeconds,
+    limit,
+    maxLimit: LIMITS.candles.max,
+    seriesFromBlock: store.seriesFromBlock(),
+    coverage,
+    note: CANDLE_NOTE,
   };
 }
 
@@ -532,6 +621,9 @@ export function createHandler({ store, config, logger = defaultLogger, now = Dat
           return;
         case '/api/price':
           sendJson(res, 200, handlePrice(store, config, params));
+          return;
+        case '/api/candles':
+          sendJson(res, 200, handleCandles(store, config, params));
           return;
         case '/api/events':
           sendJson(res, 200, handleEvents(store, params));
