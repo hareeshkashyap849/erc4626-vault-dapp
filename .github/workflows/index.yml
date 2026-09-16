@@ -1,0 +1,107 @@
+# Index new blocks on a schedule and commit the updated snapshot.
+#
+# WHY A CRON AND NOT A SERVICE
+#
+# No free hosting tier runs a long-lived process: Render sleeps a web service after
+# 15 idle minutes, Railway's free credit is about $1/month, Koyeb gives 0.1 vCPU. So
+# the indexer cannot be resident, and the design follows from that constraint rather
+# than from a preference. The vault repository's ARCHITECTURE.md section 7 records
+# the plan and the measurements behind its parameters.
+#
+# WHY THE NUMBERS ARE WHAT THEY ARE
+#
+# Base produces a block every 2.000 seconds, measured. A 5-minute cron therefore
+# covers 150 blocks, and MAX_CATCHUP_BLOCKS is 300 -- a 2x margin. Those two numbers
+# and MAX_CATCHUP_SECONDS were WRONG in the first version of the plan in a way worth
+# repeating here: a 30-minute cron with a 300-block bound can never close a 30-minute
+# gap, so every catch-up would have timed out and the deployment would have been a
+# snapshot that was permanently 30 minutes stale, with catch-up code present and
+# never working. Two timer parameters can each look sane and be jointly impossible.
+name: index
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub's scheduler can lag under load, which is what the 2x
+    # block margin is for.
+    - cron: '*/5 * * * *'
+  # Manual runs, for when a catch-up is wanted immediately.
+  workflow_dispatch:
+    inputs:
+      max_blocks:
+        description: 'Maximum blocks to scan this run'
+        required: false
+        default: '300'
+
+# The job commits the snapshot, so it needs write access. Scoped to this workflow.
+permissions:
+  contents: write
+
+# Two indexer runs writing one SQLite file is a corruption, not a race worth losing.
+concurrency:
+  group: indexer
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # No `npm install`: this service has no runtime dependencies, and the tests have
+      # no test framework beyond node:test. That is a deliberate property -- an
+      # indexer a reviewer can run with nothing but Node is worth more than one that
+      # needs a toolchain.
+      - name: Run the test suite
+        run: node tools/run-all.mjs
+
+      # The deployment record lives in the vault repository. Fetching it rather than
+      # copying the values here keeps ONE record of what was deployed where: a copy
+      # would be a second place for the address to be wrong, and the wrong one would
+      # be the one nobody updated.
+      - name: Fetch the deployment record
+        run: |
+          mkdir -p deployments
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/hareeshkashyap849/erc4626-vault/main/deployments/base-sepolia.json \
+            --output deployments/base-sepolia.json
+          echo "--- record ---"
+          cat deployments/base-sepolia.json
+
+      - name: Index new blocks
+        env:
+          DEPLOYMENT_RECORD: deployments/base-sepolia.json
+          DATABASE_PATH: data/vault.sqlite
+          RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
+          MAX_CATCHUP_BLOCKS: ${{ github.event.inputs.max_blocks || '300' }}
+          MAX_CATCHUP_SECONDS: '20'
+        run: node --experimental-strip-types src/indexer/cli.ts --verbose
+
+      # Committed rather than cached: a cache is evicted and a snapshot that vanishes
+      # is a snapshot that has to be rebuilt from the deployment block, which on a
+      # public endpoint is slow and possibly not permitted at all.
+      - name: Commit the snapshot if it changed
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/vault.sqlite
+          if git diff --staged --quiet; then
+            echo "no change this run"
+            exit 0
+          fi
+          # The block range goes in the message so the history of the snapshot is
+          # readable from `git log` without opening the database.
+          SUMMARY=$(node --experimental-strip-types -e "
+            const { DatabaseSync } = require('node:sqlite');
+            const db = new DatabaseSync('data/vault.sqlite');
+            const s = db.prepare('SELECT last_indexed_block, chain_head_at_last_run FROM indexer_state WHERE id = 1').get();
+            const n = db.prepare('SELECT COUNT(*) AS n FROM vault_events').get().n;
+            console.log(\`indexed to block \${s.last_indexed_block} (head \${s.chain_head_at_last_run}), \${n} events\`);
+          ")
+          git commit -m "data: $SUMMARY"
+          git push

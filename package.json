@@ -1,0 +1,24 @@
+{
+  "name": "erc4626-vault-dapp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Event indexer, SQLite snapshot and query API for the erc4626-vault YieldVault contract",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "index": "node --experimental-strip-types src/indexer/cli.ts",
+    "api": "node --experimental-strip-types src/api/cli.ts",
+    "check": "node tools/run-all.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^24.9.2"
+  }
+}

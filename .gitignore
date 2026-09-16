@@ -1,0 +1,32 @@
+# Build artefacts
+out/
+dist/
+*.tsbuildinfo
+
+# Only `data/vault.sqlite` -- the real snapshot -- is committed. See
+# .github/workflows/index.yml for why it is committed at all: a cache would be
+# evicted, and a snapshot that vanishes has to be rebuilt from the deployment block,
+# which is slow and on some public endpoints not permitted.
+#
+# Everything else here is disposable: the write-ahead log and shared-memory file are
+# transient, and a repository holding a WAL without its database is a corrupt database
+# rather than a slightly stale one; scratch databases from tests and from developing
+# by hand would be a second, conflicting copy of the index.
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.sqlite-journal
+!data/vault.sqlite
+
+# Node
+node_modules/
+
+# Environment
+.env
+.env.*
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

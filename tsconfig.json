@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true,
+    "types": ["node"],
+    /*
+     * Where to find `@types/node`.
+     *
+     * `node_modules/@types` is listed first, which is where a normal `npm install`
+     * puts it and therefore what a fresh clone uses. The second entry is a fallback
+     * for the environment this was built in, where the npm registry is unreachable
+     * and a copy already present elsewhere on the machine is used instead of
+     * vendoring several megabytes of type definitions into the repository.
+     *
+     * This affects TYPE CHECKING ONLY. Node strips types rather than compiling them,
+     * so nothing here changes what actually runs.
+     */
+    "typeRoots": [
+      "./node_modules/@types",
+      "../base-swap-indexer/node_modules/@types"
+    ]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
