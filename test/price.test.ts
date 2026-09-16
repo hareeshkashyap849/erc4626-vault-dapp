@@ -127,7 +127,7 @@ test('the deployed vault prices at exactly 1.1 at ratios just above it', () => {
   // where 550/500 is 1.099999999... below it.
   assert.equal(
     formatUnits(((BigInt(assets) + 1n) * 10n ** 18n * 10n ** 6n) / (BigInt(supply) + 10n ** 12n), 12),
-    '1.100000004220',
+    '1.10000000422',
     'the real row sits just above 1.1, which is why six decimals read as exactly 1.1',
   );
 });
