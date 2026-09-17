@@ -46,17 +46,38 @@ export interface Config {
 }
 
 const DEFAULTS = {
-  databasePath: 'data/vault.sqlite',
   apiPort: 8787,
   // A 5-minute cron covers 150 blocks at Base's measured 2.000 s block time. 300 is
-  // a 2x margin, and 20 s is what a measured 300-block catch-up costs with room to
-  // spare. These three numbers were WRONG together in the first version of the plan
-  // -- see the vault repository's ARCHITECTURE.md section 7.2, where the mistake is
-  // recorded rather than quietly corrected.
+  // a 2x margin, and it is the bound that should bind on a healthy endpoint.
+  //
+  // THE TIME BOUND USED TO BE 20 SECONDS AND THAT WAS WRONG. 20 was chosen from a
+  // measurement of what a 300-block catch-up costs in wall clock, which was the right
+  // question; but the code converted the budget into blocks using the CHAIN's block
+  // time, so 20 s became 9 blocks and the cron fell behind by ~141 blocks every run.
+  // See src/indexer/bounds.ts. With that fixed, the budget is still set to one cron
+  // interval (300 s) so it cannot become the binding constraint again: at the measured
+  // 4.8 blocks/s that is ~1,400 blocks, far above the 300 the block bound allows.
   maxCatchupBlocks: 300,
-  maxCatchupSeconds: 20,
+  maxCatchupSeconds: 300,
   confirmations: 0,
 };
+
+/**
+ * The database path when `DATABASE_PATH` is not set: one file per chain.
+ *
+ * WHY IT IS NOT A FIXED `data/vault.sqlite`
+ *
+ * That path is the committed snapshot, and it is maintained by the scheduled
+ * workflow, which indexes Base Sepolia into it. A local run defaulting to the same
+ * file writes rows from a local anvil chain into the published snapshot -- which is
+ * exactly what happened: the committed database held 33,702 local blocks beside a
+ * Base Sepolia deployment, with nothing in the schema saying so. Naming the file
+ * after the chain makes that mistake unavailable rather than merely discouraged,
+ * and it matches the recorded convention (`DATABASE_PATH=data/vault-<chain>.sqlite`).
+ */
+function defaultDatabasePath(chainId: number): string {
+  return `data/vault-${chainId}.sqlite`;
+}
 
 /** Read and validate a deployment record. */
 export function readDeploymentRecord(path: string): DeploymentRecord {
@@ -114,7 +135,7 @@ export function loadConfig({ recordPath, env = process.env }: { recordPath?: str
     vault: record.vault,
     asset: record.asset,
     startBlock: record.deployBlock,
-    databasePath: env.DATABASE_PATH ?? DEFAULTS.databasePath,
+    databasePath: env.DATABASE_PATH ?? defaultDatabasePath(record.chainId),
     apiPort: number(env.PORT, DEFAULTS.apiPort),
     maxCatchupBlocks: number(env.MAX_CATCHUP_BLOCKS, DEFAULTS.maxCatchupBlocks),
     maxCatchupSeconds: number(env.MAX_CATCHUP_SECONDS, DEFAULTS.maxCatchupSeconds),

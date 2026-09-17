@@ -51,6 +51,34 @@ The vault's address and start block are not configured here — they are read fr
 `../erc4626-vault/deployments/<chain>.json`, which is the single place they are known.
 Point `DEPLOYMENT_RECORD` elsewhere to index a different deployment.
 
+## The committed snapshot, and the database you get by default
+
+`data/vault.sqlite` is **committed on purpose**, and it is a cache rather than a fixture.
+A GitHub Actions cron (`*/5 * * * *`) indexes new Base Sepolia blocks into it and commits
+the result, so the service has a real index behind it without a hosted process — no free
+tier keeps a process alive, and a snapshot that vanishes has to be rebuilt from the
+deployment block, which on a public endpoint is slow and sometimes not permitted at all.
+
+That makes one thing load-bearing: **the snapshot must belong to the chain its record
+names.** So it does, and it says so:
+
+| | |
+|---|---|
+| Chain | Base Sepolia (`84532`), recorded in `indexer_state.chain_id` |
+| Deployment block | 46,919,124 — the snapshot starts exactly there, and holds no earlier row |
+| What it contains | the real `Deposit` at block 46,919,498, plus a `vault_snapshots` row per block |
+
+Two things enforce that instead of trusting it. `indexer_state.chain_id` exists because
+the schema previously could not distinguish one chain's rows from another's — the committed
+snapshot had 33,702 local anvil blocks sitting beside a Base Sepolia deployment, with a
+plausible row count and nothing to indicate the mixture. And `test/snapshot.test.ts`
+refuses a snapshot whose chain, start block, or earliest rows disagree with the record;
+it runs in the same `node tools/run-all.mjs` the workflow runs before indexing.
+
+Your default database is **`data/vault-<chainId>.sqlite`**, not the snapshot: a local run
+against anvil writes `data/vault-31337.sqlite`. Set `DATABASE_PATH` to point anywhere,
+including at the snapshot — the workflow does exactly that.
+
 ## The API
 
 | Endpoint | Returns |

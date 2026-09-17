@@ -156,7 +156,7 @@ function loadedStore({ startBlock = FIXTURE.fromBlock, snapshotsFrom }: { startB
   store.insertTransfers(FIXTURE_TRANSFERS);
   const snapshots = fixtureSnapshots(FIXTURE_EVENTS).filter((s) => snapshotsFrom === undefined || s.blockNumber >= snapshotsFrom);
   store.upsertSnapshots(snapshots);
-  store.setState({ lastIndexedBlock: LAST_EVENT_BLOCK, chainHead: CHAIN_HEAD, startBlock });
+  store.setState({ lastIndexedBlock: LAST_EVENT_BLOCK, chainHead: CHAIN_HEAD, startBlock, chainId: 31337 });
   return store;
 }
 
@@ -460,7 +460,7 @@ test('a series that starts after the deployment block says so, and does not impl
 
 test('an empty series says it is empty rather than reporting coverage from block 0', async () => {
   const store = emptyStore();
-  store.setState({ lastIndexedBlock: 8, chainHead: 8, startBlock: 8 });
+  store.setState({ lastIndexedBlock: 8, chainHead: 8, startBlock: 8, chainId: 31337 });
   try {
     await withServer({ store, config: CONFIG }, async (base) => {
       const { body } = await get(base, '/api/price');

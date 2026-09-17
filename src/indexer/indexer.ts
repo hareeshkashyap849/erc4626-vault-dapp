@@ -32,6 +32,7 @@ import type { RpcClient, BlockHeader } from '../lib/rpc.ts';
 import type { Store, VaultEventRow, ShareTransferRow, VaultSnapshotRow } from '../lib/db.ts';
 import { TOPICS, decodeVaultLog, decodeShareTransfer, assertTopics, type RawLog } from '../lib/decode.ts';
 import { decodeUintResult } from '../lib/rpc.ts';
+import { chooseLimit, scanRateFromHistory } from './bounds.ts';
 
 export interface IndexerConfig {
   vault: string;
@@ -160,7 +161,15 @@ export class Indexer {
     const fromBlock = state && state.lastIndexedBlock >= this.config.startBlock - 1 ? state.lastIndexedBlock + 1 : this.config.startBlock;
 
     if (target < fromBlock) {
-      this.store.setState({ lastIndexedBlock: Math.max(fromBlock - 1, this.config.startBlock - 1), chainHead, startBlock: this.config.startBlock });
+      this.store.setState({
+        lastIndexedBlock: Math.max(fromBlock - 1, this.config.startBlock - 1),
+        chainHead,
+        startBlock: this.config.startBlock,
+        chainId: this.config.chainId,
+      });
+      // Recorded even when there was nothing to do: a gap in the log would otherwise be
+      // ambiguous between "the cron did not run" and "the cron ran and found nothing".
+      this.store.log('info', 'run', `scanned=0 elapsedMs=${now() - started} toBlock=${fromBlock - 1} upToDate=true`);
       return {
         fromBlock,
         toBlock: fromBlock - 1,
@@ -176,31 +185,36 @@ export class Indexer {
       };
     }
 
-    const byBlocks = Math.min(maxBlocks, target - fromBlock + 1);
+    const blocksNeeded = target - fromBlock + 1;
     const spentMs = now() - started;
-    const byTime = Math.max(0, maxSeconds * 1000 - spentMs);
-    // Time is converted to blocks using the measured block time, so the two bounds
-    // are comparable. Both are then taken, and whichever is smaller wins -- two
-    // limits that each look generous can still be jointly impossible, which is the
-    // mistake the vault repository's ARCHITECTURE.md section 7.2 documents.
-    const blockTime = this.#blockTimeMs();
-    const blocksPerSecond = 1000 / Math.max(1, blockTime);
-    const timeBlocks = Math.max(1, Math.floor((byTime / 1000) * blocksPerSecond));
-    const limit = Math.max(1, Math.min(byBlocks, timeBlocks));
+    const remainingMs = Math.max(0, maxSeconds * 1000 - spentMs);
+    // The budget is wall-clock time, so it is converted at the RATE THIS INDEXER SCANS,
+    // not at the chain's block time. Using the chain's block time here made a 20-second
+    // budget mean 9 blocks on Base. See src/indexer/bounds.ts.
+    const scanBlocksPerSecond = this.#scanRate();
+    const { byBlocks, timeBlocks, limit } = chooseLimit({ maxBlocks, blocksNeeded, remainingMs, scanBlocksPerSecond });
 
     if (this.verbose) {
       this.store.log(
         'info',
         'bounds',
         `maxBlocks=${maxBlocks} target=${target} from=${fromBlock} byBlocks=${byBlocks} ` +
-          `spentMs=${spentMs} byTime=${Math.round(byTime)} blockTimeMs=${Math.round(blockTime)} timeBlocks=${timeBlocks} limit=${limit}`,
+          `spentMs=${spentMs} byTime=${Math.round(remainingMs)} scanBlocksPerSecond=${scanBlocksPerSecond.toFixed(1)} ` +
+          `timeBlocks=${timeBlocks} limit=${limit}`,
       );
     }
 
     const toBlock = Math.min(target, fromBlock + limit - 1);
     const result = await this.indexRange(fromBlock, toBlock);
 
-    this.store.setState({ lastIndexedBlock: toBlock, chainHead, startBlock: this.config.startBlock });
+    this.store.setState({ lastIndexedBlock: toBlock, chainHead, startBlock: this.config.startBlock, chainId: this.config.chainId });
+
+    // Recorded as evidence as well as for the next run's budget: `scanned`/`elapsedMs`
+    // is what makes the scan rate measurable rather than assumed, and a reviewer can
+    // read the progress of every run out of the log.
+    const scanned = toBlock - fromBlock + 1;
+    const elapsedMs = now() - started;
+    this.store.log('info', 'run', `scanned=${scanned} elapsedMs=${elapsedMs} toBlock=${toBlock}`);
 
     return {
       ...result,
@@ -209,26 +223,26 @@ export class Indexer {
       reorgDepth,
       truncated: toBlock < target,
       chainHead,
-      elapsedMs: now() - started,
+      elapsedMs,
     };
   }
 
   /**
-   * The measured block time, or a conservative default.
+   * The rate at which this indexer scans blocks, from the last run that recorded one.
    *
-   * Used only to convert a wall-clock budget into a block budget. Guessing too high
-   * wastes the budget; guessing too low stops early. Neither is dangerous, which is
-   * why this falls back rather than failing.
+   * Used to convert a wall-clock budget into a block budget. The chain's block time is
+   * NOT used for this -- see src/indexer/bounds.ts for the measurement that made that a
+   * defect rather than a preference.
+   *
+   * Falling back to a conservative default is the right failure: no history means the
+   * first run has nothing to learn from, and under-stating the rate only makes a run
+   * stop earlier than it could have.
    */
-  #blockTimeMs(): number {
-    const rows = this.store.priceSeries(2);
-    if (rows.length < 2) return 2000;
-    const newer = rows[0]!;
-    const older = rows[1]!;
-    const seconds = newer.timestamp - older.timestamp;
-    const blocks = newer.blockNumber - older.blockNumber;
-    if (blocks <= 0 || seconds <= 0) return 2000;
-    return (seconds / blocks) * 1000;
+  #scanRate(): number {
+    // A run that had nothing to do logs `scanned=0`, which says nothing about the rate;
+    // skip those and use the most recent run that actually scanned something.
+    const lastRun = this.store.recentLog(50).find((row) => row.event === 'run' && /scanned=[1-9]/.test(row.detail ?? ''));
+    return scanRateFromHistory(lastRun?.detail);
   }
 
   /** Index one inclusive range. Idempotent, so re-running it is always safe. */

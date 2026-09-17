@@ -8,6 +8,12 @@ dist/
 # evicted, and a snapshot that vanishes has to be rebuilt from the deployment block,
 # which is slow and on some public endpoints not permitted.
 #
+# It is the BASE SEPOLIA snapshot, and the workflow is the only thing that should write
+# to it. A local run defaults to `data/vault-<chainId>.sqlite` instead -- here
+# `data/vault-31337.sqlite` -- because when the default was this path, a local anvil run
+# wrote 33,702 local blocks into the published snapshot beside a Base Sepolia
+# deployment. The rows were ignored by this rule, not by the indexer.
+#
 # Everything else here is disposable: the write-ahead log and shared-memory file are
 # transient, and a repository holding a WAL without its database is a corrupt database
 # rather than a slightly stale one; scratch databases from tests and from developing

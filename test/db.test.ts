@@ -23,9 +23,11 @@
  */
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { readFileSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 
 import { openStore, type VaultEventRow, type ShareTransferRow, type VaultSnapshotRow } from '../src/lib/db.ts';
 import { TOPICS, decodeVaultLog, decodeShareTransfer, type RawLog } from '../src/lib/decode.ts';
@@ -171,18 +173,19 @@ test('rollback is itself idempotent', () => {
 
 // ----------------------------------------------------------------- state & log
 
-test('state round-trips, including the start block', () => {
+test('state round-trips, including the start block and the chain it came from', () => {
   withStore((store) => {
     assert.equal(store.getState(), undefined, 'no state before the first run');
 
-    store.setState({ lastIndexedBlock: 500, chainHead: 520, startBlock: 8 });
+    store.setState({ lastIndexedBlock: 500, chainHead: 520, startBlock: 8, chainId: 31337 });
     const state = store.getState()!;
     assert.equal(state.lastIndexedBlock, 500);
     assert.equal(state.chainHeadAtLastRun, 520);
     assert.equal(state.startBlock, 8);
+    assert.equal(state.chainId, 31337, 'the chain is stored, so a snapshot can be refused when it disagrees with the record');
     assert.ok(state.updatedAt > 0);
 
-    store.setState({ lastIndexedBlock: 600, chainHead: 600, startBlock: 8 });
+    store.setState({ lastIndexedBlock: 600, chainHead: 600, startBlock: 8, chainId: 31337 });
     assert.equal(store.getState()!.lastIndexedBlock, 600, 'a later run advances it');
   });
 });
@@ -248,7 +251,51 @@ test('a store re-opened on the same file keeps its contents', () => {
   const { events } = fixtureRows();
   withStore((store) => {
     store.insertEvents(events);
-    store.setState({ lastIndexedBlock: 999, chainHead: 1000, startBlock: 8 });
+    store.setState({ lastIndexedBlock: 999, chainHead: 1000, startBlock: 8, chainId: 31337 });
     assert.equal(store.countEvents(), events.length);
   });
+});
+
+/**
+ * @dev The committed snapshot is an artifact that gets OPENED, not rebuilt.
+ *
+ * `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already exists,
+ * so a database written before `chain_id` existed would keep working while reporting
+ * nothing about its chain -- and the checker that refuses a mismatched snapshot would
+ * have nothing to compare. The migration is therefore tested against a database built
+ * with the OLD schema, not against one this code created.
+ *
+ * The added value must be NULL, not a guess: a wrong chain id in the one column that
+ * exists to detect a wrong chain id is worse than an absent one.
+ */
+test('a database from before chain_id existed is migrated, and its chain stays unknown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vault-legacy-'));
+  const path = join(dir, 'legacy.sqlite');
+  try {
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE indexer_state (
+        id                     INTEGER PRIMARY KEY CHECK (id = 1),
+        last_indexed_block     INTEGER NOT NULL,
+        chain_head_at_last_run INTEGER NOT NULL,
+        updated_at             INTEGER NOT NULL,
+        start_block            INTEGER NOT NULL
+      );`);
+    legacy
+      .prepare('INSERT INTO indexer_state (id, last_indexed_block, chain_head_at_last_run, updated_at, start_block) VALUES (1, ?, ?, ?, ?)')
+      .run(500, 520, 1, 8);
+    legacy.close();
+
+    const store = openStore(path);
+    try {
+      const state = store.getState()!;
+      assert.equal(state.startBlock, 8, 'the row that was already there survives');
+      assert.equal(state.lastIndexedBlock, 500);
+      assert.equal(state.chainId, null, 'an unknown chain must stay unknown, not be guessed');
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

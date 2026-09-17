@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { loadConfig, readDeploymentRecord, CONFIG_DEFAULTS } from '../src/config.ts';
+import { blocksForBudget, DEFAULT_SCAN_BLOCKS_PER_SECOND } from '../src/indexer/bounds.ts';
 
 const GOOD = {
   chainId: 31337,
@@ -186,6 +187,23 @@ test('a non-numeric environment value is an error rather than a silent NaN', () 
   });
 });
 
+/**
+ * @dev The default database path is per chain, and this test is the reason why.
+ *
+ * `data/vault.sqlite` is the COMMITTED snapshot, maintained by the scheduled workflow,
+ * which indexes Base Sepolia into it. When the default also pointed there, a local run
+ * against anvil wrote 33,702 local blocks into the published snapshot, beside a Base
+ * Sepolia deployment, with no column recording which chain any row came from. A
+ * default that cannot express that mistake is worth more than a comment saying not to.
+ */
+test('the default database is one file per chain, not the published snapshot', () => {
+  withRecord(GOOD, (path) => {
+    const config = loadConfig({ recordPath: path, env: {} as NodeJS.ProcessEnv });
+    assert.equal(config.databasePath, 'data/vault-31337.sqlite', 'the chain id names the file');
+    assert.notEqual(config.databasePath, 'data/vault.sqlite', 'data/vault.sqlite belongs to the workflow that maintains it');
+  });
+});
+
 test('defaults are the documented ones, and the pair is internally consistent', () => {
   withRecord(GOOD, (path) => {
     const config = loadConfig({ recordPath: path, env: {} as NodeJS.ProcessEnv });
@@ -201,6 +219,19 @@ test('defaults are the documented ones, and the pair is internally consistent', 
     assert.ok(
       config.maxCatchupBlocks >= blocksPerCron,
       `maxCatchupBlocks (${config.maxCatchupBlocks}) must cover one cron interval (${blocksPerCron} blocks) or the catch-up can never close the gap`,
+    );
+
+    // AND THE OTHER HALF OF THE PAIR, which is the half that was wrong. The block bound
+    // above passed while the time bound allowed 9 blocks per run, because the budget was
+    // converted with the chain's block time instead of the indexer's scan rate. The
+    // criterion is not "the number looks big": it is that the budget must let a run
+    // cover a whole cron interval's worth of blocks at the conservative measured rate.
+    const allowedByTime = blocksForBudget(config.maxCatchupSeconds * 1000, DEFAULT_SCAN_BLOCKS_PER_SECOND);
+    assert.ok(
+      allowedByTime >= blocksPerCron,
+      `maxCatchupSeconds (${config.maxCatchupSeconds} s) allows only ${allowedByTime} blocks at the conservative ` +
+        `${DEFAULT_SCAN_BLOCKS_PER_SECOND} blocks/s, fewer than the ${blocksPerCron} a cron interval produces -- ` +
+        'the snapshot would fall further behind every run',
     );
   });
 });

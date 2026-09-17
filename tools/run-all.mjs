@@ -28,11 +28,21 @@ const NODE_FLAGS = ['--experimental-strip-types', '--no-warnings'];
 
 const CHECKS = [
   { name: 'keccak and event decoding (against real logs)', file: 'test/decode.test.ts' },
+  // Existed but was never listed here, so it was never run -- found by this runner's own
+  // "listed but missing" guard. It covers the real-deployment bug: a public endpoint
+  // answers `0x` for a read at the deployment block, which is not zero.
+  { name: 'RPC results: "0x" is unknown, never zero', file: 'test/rpc-results.test.ts' },
   { name: 'storage: idempotence and reorg rollback', file: 'test/db.test.ts' },
   { name: 'share price arithmetic', file: 'test/price.test.ts' },
   { name: 'candlestick aggregation and formatting', file: 'test/chart.test.ts' },
   { name: 'query API', file: 'test/api.test.ts' },
   { name: 'configuration and deployment record', file: 'test/config.test.ts' },
+  // The two run bounds decide whether a scheduled indexer keeps up; their arithmetic is
+  // tested because the comparison was right and the unit was wrong once.
+  { name: 'run bounds: wall clock, not chain time', file: 'test/bounds.test.ts' },
+  // The committed snapshot is an artifact, and an artifact that is never checked is
+  // an artifact that drifts. Skips itself when the snapshot or the record is absent.
+  { name: 'committed snapshot matches the deployment record', file: 'test/snapshot.test.ts' },
 ];
 
 const failures = [];

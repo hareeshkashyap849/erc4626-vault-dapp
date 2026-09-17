@@ -96,6 +96,22 @@ export interface IndexerState {
   updatedAt: number;
   /** Where the vault was deployed. The first block an indexer may not skip. */
   startBlock: number;
+  /**
+   * The chain these rows came from, or `null` for a database written before this
+   * column existed.
+   *
+   * WHY THIS IS STORED AT ALL
+   *
+   * Nothing else in the schema identifies the chain. Block numbers alone do not:
+   * a local chain's 8 and Base Sepolia's 8 are different blocks, and the two sets
+   * of rows sit happily side by side in one file with a plausible row count. That
+   * is not hypothetical -- it happened here, and the committed snapshot carried
+   * rows from a local anvil chain next to rows from Base Sepolia.
+   *
+   * `null` is deliberately not defaulted to a chain id: an unknown chain must stay
+   * unknown, so a checker can refuse it rather than compare against a guess.
+   */
+  chainId: number | null;
 }
 
 const SCHEMA = `
@@ -159,7 +175,10 @@ CREATE TABLE IF NOT EXISTS indexer_state (
   last_indexed_block     INTEGER NOT NULL,
   chain_head_at_last_run INTEGER NOT NULL,
   updated_at             INTEGER NOT NULL,
-  start_block            INTEGER NOT NULL
+  start_block            INTEGER NOT NULL,
+  -- Nullable on purpose: a database written before this column existed reports
+  -- "unknown", which a checker can refuse. See IndexerState.chainId.
+  chain_id               INTEGER
 );
 
 -- Append-only, so a reviewer can see what the indexer actually did, including
@@ -187,6 +206,21 @@ export class Store {
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * Additive migrations, applied to a database that already exists.
+   *
+   * `CREATE TABLE IF NOT EXISTS` above does nothing to a table that is already
+   * there, so a column added later never appears in an existing snapshot -- and the
+   * snapshot is a committed artifact that is expected to be opened, not rebuilt.
+   * The column is added as NULL rather than backfilled with a guessed chain id:
+   * an unknown chain has to stay unknown for the checker to be able to refuse it.
+   */
+  private migrate(): void {
+    const columns = (this.db.prepare('PRAGMA table_info(indexer_state)').all() as { name: string }[]).map((c) => c.name);
+    if (!columns.includes('chain_id')) this.db.exec('ALTER TABLE indexer_state ADD COLUMN chain_id INTEGER');
   }
 
   /**
@@ -296,36 +330,47 @@ export class Store {
     }));
   }
 
-  setState(state: { lastIndexedBlock: number; chainHead: number; startBlock: number }): void {
+  setState(state: { lastIndexedBlock: number; chainHead: number; startBlock: number; chainId: number }): void {
     this.db
       .prepare(
-        `INSERT INTO indexer_state (id, last_indexed_block, chain_head_at_last_run, updated_at, start_block)
-         VALUES (1, ?, ?, ?, ?)
+        `INSERT INTO indexer_state (id, last_indexed_block, chain_head_at_last_run, updated_at, start_block, chain_id)
+         VALUES (1, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            last_indexed_block     = excluded.last_indexed_block,
            chain_head_at_last_run = excluded.chain_head_at_last_run,
            updated_at             = excluded.updated_at,
-           start_block            = excluded.start_block`,
+           start_block            = excluded.start_block,
+           chain_id               = excluded.chain_id`,
       )
-      .run(state.lastIndexedBlock, state.chainHead, Date.now(), state.startBlock);
+      .run(state.lastIndexedBlock, state.chainHead, Date.now(), state.startBlock, state.chainId);
   }
 
   log(level: 'info' | 'warn' | 'error', event: string, detail?: string): void {
     this.db.prepare('INSERT INTO indexer_log (ts, level, event, detail) VALUES (?, ?, ?, ?)').run(Date.now(), level, event, detail ?? null);
   }
 
+  /** The most recent log rows, newest first. The log is evidence, so it is readable. */
+  recentLog(limit: number): { ts: number; level: string; event: string; detail: string | null }[] {
+    return this.db
+      .prepare('SELECT ts, level, event, detail FROM indexer_log ORDER BY id DESC LIMIT ?')
+      .all(limit) as { ts: number; level: string; event: string; detail: string | null }[];
+  }
+
   // ------------------------------------------------------------------- reads
 
   getState(): IndexerState | undefined {
     const row = this.db
-      .prepare('SELECT last_indexed_block, chain_head_at_last_run, updated_at, start_block FROM indexer_state WHERE id = 1')
-      .get() as { last_indexed_block: number; chain_head_at_last_run: number; updated_at: number; start_block: number } | undefined;
+      .prepare('SELECT last_indexed_block, chain_head_at_last_run, updated_at, start_block, chain_id FROM indexer_state WHERE id = 1')
+      .get() as
+      | { last_indexed_block: number; chain_head_at_last_run: number; updated_at: number; start_block: number; chain_id: number | null }
+      | undefined;
     if (!row) return undefined;
     return {
       lastIndexedBlock: row.last_indexed_block,
       chainHeadAtLastRun: row.chain_head_at_last_run,
       updatedAt: row.updated_at,
       startBlock: row.start_block,
+      chainId: row.chain_id ?? null,
     };
   }
 

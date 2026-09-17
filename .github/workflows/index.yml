@@ -17,6 +17,17 @@
 # gap, so every catch-up would have timed out and the deployment would have been a
 # snapshot that was permanently 30 minutes stale, with catch-up code present and
 # never working. Two timer parameters can each look sane and be jointly impossible.
+#
+# THE SAME MISTAKE WAS THEN MADE AGAIN, IN THE OTHER DIRECTION, and only a real run
+# showed it. MAX_CATCHUP_SECONDS was 20, chosen from measuring what a 300-block
+# catch-up costs in wall clock; but the indexer converted that budget into blocks
+# using the CHAIN's 2.000 s block time, so 20 seconds meant 9 blocks against the 150
+# a cron interval produces. Measured with these exact values: one run indexed 9
+# blocks and reported TRUNCATED while the head advanced 58 blocks in the 90 seconds
+# before it. That is a snapshot that falls further behind every 5 minutes while every
+# run looks successful. The conversion is fixed (see src/indexer/bounds.ts) and the
+# budget is now one cron interval, so the block bound is the one that binds: at the
+# measured 4.8 blocks/s, 300 s allows about 1,400 blocks.
 name: index
 
 on:
@@ -79,7 +90,8 @@ jobs:
           DATABASE_PATH: data/vault.sqlite
           RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
           MAX_CATCHUP_BLOCKS: ${{ github.event.inputs.max_blocks || '300' }}
-          MAX_CATCHUP_SECONDS: '20'
+          # One cron interval, so the time bound cannot become the binding constraint.
+          MAX_CATCHUP_SECONDS: '300'
         run: node --experimental-strip-types src/indexer/cli.ts --verbose
 
       # Committed rather than cached: a cache is evicted and a snapshot that vanishes
