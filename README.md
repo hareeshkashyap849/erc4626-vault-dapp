@@ -14,7 +14,7 @@ answer:
 
 | | |
 |---|---|
-| **The index this service produces** | committed at `data/vault.sqlite` and written to be kept current by a scheduled workflow (`.github/workflows/index.yml`, every 5 minutes). It holds the Base Sepolia index: `chain_id` 84532, starting exactly at the deployment block 46,919,124, including the real `Deposit` at 46,919,498. **Whether that workflow has actually run is not something this file can establish** — the run history is the place to check it, and a cron that has never fired is a plan rather than a fact. |
+| **The index this service produces** | committed at `data/vault.sqlite` and written to be kept current by a scheduled workflow (`.github/workflows/index.yml`, every 5 minutes). It holds the Base Sepolia index: `chain_id` 84532, starting at block 46,919,124 — one block *before* the vault's own deployment block, 46,919,125, which is allowed and explained under "the snapshot must belong to the chain its record names" below — including the real `Deposit` at 46,919,498. **Whether that workflow has actually run is not something this file can establish** — the run history is the place to check it, and a cron that has never fired is a plan rather than a fact. |
 | **That the cron had never once worked** | measured 2026-09-17 against the GitHub API: runs #1..#105, every one `event=schedule`, 104 of them `conclusion=failure` and the 105th queued at the moment of reading, failing immediately after. Zero green runs and **zero commits by `github-actions[bot]`** — `data/vault.sqlite` has five commits and all five are the author's. The snapshot stood at block 46,919,979 while the chain head was 46,946,137: **~26,158 blocks, about 14.5 hours stale.** Two causes: the `BASE_SEPOLIA_RPC_URL` secret had never been created, so `RPC_URL` expanded empty and the indexer stopped with `RpcClient needs a url`; and once it existed, `src/lib/rpc.ts` treated a `429` like any other rejection — one retry, then throw — which skipped the commit step below, so a momentary throttle cost a whole snapshot interval. Both are now fixed; the workflow header carries the same record. **A failing scheduled workflow notifies nobody by default, which is why this is written down here.** |
 | **This service itself** | **not hosted.** No free tier runs a long-lived process, so the design is a scheduled catch-up that commits its snapshot rather than a resident server. That is why the workflow exists and why the snapshot is committed at all. |
 | **The front end that reads it** | the console at <https://hareeshkashyap849.github.io/vault-console/> is published as a static export, so it has **no route to this service** and says so on the history page. Pointing its `indexApiUrl` at a hosted instance of this API is the change that would light that page up. |
@@ -79,15 +79,18 @@ names.** So it does, and it says so:
 | | |
 |---|---|
 | Chain | Base Sepolia (`84532`), recorded in `indexer_state.chain_id` |
-| Deployment block | 46,919,124 — the snapshot starts exactly there, and holds no earlier row |
+| The vault's deployment block | **46,919,125** — the block containing the vault's CREATE (`0x91cf6315…`), which is what the record's `deployBlock` means |
+| Where the snapshot starts | **46,919,124** — one block EARLIER, and deliberately so. The indexer was pointed at the record when the record said 46,919,124 (that number is the deployment script's `DeployValidation` library, which `forge script` sends one block before the vault). Starting at or before the deployment block costs one scanned block and cannot miss an event; starting after it loses events for good. Moving a committed index forward one block would delete its only row for that block in exchange for two numbers looking alike, which is not a reason. |
 | What it contains | the real `Deposit` at block 46,919,498, plus a `vault_snapshots` row per block |
 
 Two things enforce that instead of trusting it. `indexer_state.chain_id` exists because
 the schema previously could not distinguish one chain's rows from another's — the committed
 snapshot had 33,702 local anvil blocks sitting beside a Base Sepolia deployment, with a
-plausible row count and nothing to indicate the mixture. And `test/snapshot.test.ts`
-refuses a snapshot whose chain, start block, or earliest rows disagree with the record;
-it runs in the same `node tools/run-all.mjs` the workflow runs before indexing.
+plausible row count and nothing to indicate the mixture. And `test/snapshot.test.ts` refuses a
+snapshot whose chain disagrees with the record, whose start block is **later** than the deployment
+block (early is safe, late loses events permanently — the two are not asserted equal, because a
+correct snapshot may start early), or that holds a row earlier than the start block it claims; it
+runs in the same `node tools/run-all.mjs` the workflow runs before indexing.
 
 Your default database is **`data/vault-<chainId>.sqlite`**, not the snapshot: a local run
 against anvil writes `data/vault-31337.sqlite`. Set `DATABASE_PATH` to point anywhere,
