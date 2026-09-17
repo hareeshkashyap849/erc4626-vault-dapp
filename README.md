@@ -73,6 +73,16 @@ the result, so the service has a real index behind it without a hosted process �
 tier keeps a process alive, and a snapshot that vanishes has to be rebuilt from the
 deployment block, which on a public endpoint is slow and sometimes not permitted at all.
 
+**The cron is not five minutes.** Measured 2026-09-17 from the run history: consecutive
+scheduled runs (#93..#107) were 15.4 to 27.5 minutes apart, median 19.1 — GitHub's scheduler
+does not deliver `*/5`, and it cannot be asked for anything shorter. Since Base produces a
+block every 2.000 s, that interval produces ~573 blocks, which is why `MAX_CATCHUP_BLOCKS` is
+**3000** and not the 300 it was: a bound below one interval is a guaranteed net loss on every
+run. Measured after the change, on three consecutive runs: **+3000 blocks each**, and the gap
+fell 26,629 → 23,833 → 21,002 → 18,224 while the chain kept producing blocks throughout. The
+arithmetic and the full record — including the two earlier parameter mistakes, kept on purpose
+— is in the workflow header, which is where a reader should go before changing either number.
+
 That makes one thing load-bearing: **the snapshot must belong to the chain its record
 names.** So it does, and it says so:
 
@@ -141,8 +151,9 @@ that the blocks before it are **not known**, rather than reporting zero activity
 
 ## What is not done
 
-- **Not deployed.** The cron workflow exists and has not run against a public network,
-  because that needs a funded deployment in the vault repository first (its P2).
+- **Not deployed.** The cron workflow exists and has run against a public network only to
+  maintain the snapshot; the API is not hosted anywhere, because no free tier keeps a process
+  alive.
 - **No reorg test against a real chain.** The rollback path is tested against the
   database, not against a chain that actually reorganised.
 - **The API is read-only and unauthenticated**, which is correct for public on-chain

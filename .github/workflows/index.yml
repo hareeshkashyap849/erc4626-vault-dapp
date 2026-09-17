@@ -66,26 +66,42 @@
 #
 #   MAX_CATCHUP_BLOCKS = 3000
 #     one real scheduler interval produces 460-825 blocks, so 3000 leaves 2175-2540 blocks of
-#     headroom; it takes 3000 / 20.5 = 146 s to scan at the rate the runner measured
-#     (300 blocks in 14,654 ms, run #108), against 573 blocks produced per median interval --
-#     so the net drain is ~2427 blocks per interval, and the 26,612-block backlog measured on
-#     2026-09-17 is ~11 intervals, about 3.5 hours, as opposed to never.
+#     headroom; at the rate the runner measured (300 blocks in 14,654 ms, run #108, so
+#     20.5 blocks/s) it is 146 s of scanning, against 573 blocks produced per median interval --
+#     a net drain of ~2427 blocks per interval, so the 26,612-block backlog measured on
+#     2026-09-17 is ~11 intervals, as opposed to never.
+#
+#     AND IT WAS MEASURED AFTER THE CHANGE, on three consecutive runs of this workflow with
+#     these exact values. Every one scanned its full 3000 and committed it, and the gap fell
+#     each time -- against a chain that was still producing blocks throughout:
+#
+#       run #115 (manual)    46,921,179 -> 46,924,179   +3000 in 154,662 ms   gap 26,629 -> 23,833
+#       run #116 (schedule)  46,924,179 -> 46,927,179   +3000 in 250,313 ms   gap 23,833 -> 21,002
+#       run #117 (manual)    46,927,179 -> 46,930,179   +3000 in 167,502 ms   gap 21,002 -> 18,224
+#
+#     (each gap is the chain head AT THAT RUN against the block that run indexed, so the
+#     blocks produced during the run are already counted against it. The three runs advanced
+#     the snapshot 9000 blocks in about 11 minutes.) The scan rate measured 19.4, 12.0 and
+#     17.9 blocks/s, so the rate moves with the endpoint and the log records which one applied;
+#     17.5 blocks/s is the working figure, and every run still finished the whole bound.
 #
 #   MAX_CATCHUP_SECONDS = 450
 #     this is a CEILING, not a target. It must not be the bound that decides a healthy run:
 #     the conversion is `seconds x scan rate` (src/indexer/bounds.ts), the rate is the last
 #     run's measured one, and 450 x 20.5 = 9225 blocks is far above the 3000 the block bound
 #     allows, so the block bound decides. It must also fit the job: this job has
-#     `timeout-minutes: 10`, checkout + tests + record fetch measured 45 s, so 450 + 45 = 495 s
-#     of the 600 available, and a run that hits the ceiling still commits rather than being
-#     killed mid-scan. On a first, cold run -- no history, so the conservative 4 blocks/s
-#     default applies -- the ceiling allows 1800 blocks, which is deliberately the bound that
-#     decides until a rate has been measured.
+#     `timeout-minutes: 10`, and the budget is expressed as time spent INSIDE the indexer,
+#     which starts about 11 s into the job -- checkout + setup-node + the test suite + the
+#     record fetch measured 9-11 s across runs #115..#117. So a run that spent its whole
+#     ceiling would end around 450 + 11 + a few seconds of commit and push, about 470 s of the
+#     600 available, and it commits rather than being killed mid-scan. On a first, cold run --
+#     no history, so the conservative 4 blocks/s default applies -- the ceiling allows 1800
+#     blocks, which is deliberately the bound that decides until a rate has been measured.
 #
-#   Why not 6000: the same arithmetic gives 293 s at the runner's rate, and 293 + 45 + a push
-#     is inside 600 s only if the endpoint holds that rate for a 3x larger range, which has not
-#     been measured. 3000 is the largest value the measurements support; a bound that
-#     overruns the job timeout is worse than a smaller one, because it commits nothing.
+#   Why not 6000: the same arithmetic gives 293 s at the measured rate, and the runs above show
+#     the rate is not stable (12.0 blocks/s on the slowest of the three), so 6000 would need
+#     500 s on a slow pass and would risk spending the whole 10-minute job on a scan that then
+#     commits nothing. 3000 finished with room to spare on all three, including the slow one.
 #
 #   Why not more runners: two runners writing one SQLite file is a corruption, not a race worth
 #     losing. The bound is how a single writer gets further per run.
@@ -149,7 +165,6 @@ on:
         description: 'Maximum blocks to scan this run'
         required: false
         default: '3000'
-
 # The job commits the snapshot, so it needs write access. Scoped to this workflow.
 permissions:
   contents: write
@@ -202,8 +217,10 @@ jobs:
           # A ceiling, not a target: 450 x the measured 20.5 blocks/s is 9225 blocks, well
           # above the block bound, so the block bound is what decides a healthy run. It is
           # 450 rather than 300 because at the conservative first-run rate of 4 blocks/s the
-          # budget has to stay above one real interval, and 450 + 45 s of setup is still
-          # inside the job's 10-minute timeout. See the header for the whole arithmetic.
+          # budget has to stay above one real interval, and 450 + the ~11 s the job spends
+          # before the indexer starts is still inside the job's 10-minute timeout. Measured
+          # after this change: 3000 blocks in 154-250 s across runs #115..#117, whole job
+          # 165-263 s. See the header for the whole arithmetic.
           MAX_CATCHUP_SECONDS: '450'
         run: node --experimental-strip-types src/indexer/cli.ts --verbose
 
