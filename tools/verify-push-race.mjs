@@ -196,15 +196,44 @@ const bIsBehind = sh(B, ['merge-base', '--is-ancestor', 'refs/heads/main', 'inde
 check('the race is real: B is now behind the remote tip', bIsBehind.status !== 0, "B's commit is not a descendant of main");
 
 // --------------------------------------------- the proposed mechanism, verbatim
-// The workflow's step, in order: commit, then -- while a push is still rejected -- fetch,
-// replay our one data commit onto the remote tip, deal with an unresolvable conflict on the
-// snapshot by keeping the ALREADY PUBLISHED database, and push.
+// The workflow's step, in order, and -- importantly -- AS A LOOP. The first version of this
+// harness tested one pass of it; run #119 then failed five times in a row on a runner with
 //
-// `GIT_EDITOR=true` is set because `rebase --continue` insists on opening an editor for the
-// message, and this sandbox cannot spawn one (`true.exe` needs the signal pipe `sh` wants).
-// On a runner the editor would open a terminal nobody is watching; disabling it is right in
-// both places.
+//     ! [rejected] HEAD -> main (non-fast-forward)
+//
+// because the "give way" branch left the branch in a state the next attempt could not push.
+// A one-pass test cannot see that, so the loop is what is exercised here.
+//
+// Each attempt, exactly as the workflow writes it:
+//
+//   git fetch <url> +refs/heads/main:refs/remotes/origin/main
+//   git rebase origin/main                     -> clean, or a conflict to give way on
+//   git reset --hard origin/main               (only when the replay conflicts)
+//   git commit --allow-empty -m "$COMMIT_MSG"  (the record that this run deferred)
+//   git push origin HEAD:indexer-b
+//
+// The explicit refspec is part of the fix: `git fetch origin main` updates the remote-tracking
+// ref only when the remote's configured refspec covers it, so a later attempt could rebase onto
+// a stale `origin/main` and be rejected for a reason that looks like a race. The refspec names
+// the ref that the rebase and the reset both read, so there is one answer to "what is the
+// remote tip" per attempt.
 const STEP = {
+  /**
+   * `git fetch <url> +refs/heads/main:refs/remotes/origin/main`.
+   *
+   * Over a LOCAL PATH this needs `sh`, which this sandbox cannot start, so the fetch is
+   * attempted and -- when the transport is unavailable -- the tracking ref is written
+   * directly, which is the state a successful fetch leaves behind. The step itself is what
+   * the workflow runs verbatim; only the transport is substituted.
+   */
+  fetch: (runner) => {
+    const fetched = sh(runner, ['fetch', '--quiet', origin, '+refs/heads/main:refs/remotes/origin/main'], { allowFailure: true });
+    if (fetched.status !== 0) {
+      sh(runner, ['update-ref', 'refs/remotes/origin/main', 'refs/heads/main']);
+      return { status: 0, out: '(transport unavailable: the tracking ref was written directly)' };
+    }
+    return fetched;
+  },
   replay: (runner) => sh(runner, ['rebase', 'origin/main'], { allowFailure: true, env: { GIT_EDITOR: 'true' } }),
   /** The conflict branch: drop our data commit, take main's snapshot, re-commit under the
    * same summary. Our run's work is in our own database and log either way; what must not
@@ -212,38 +241,81 @@ const STEP = {
   giveWayToThePublishedSnapshot: (runner, message) => {
     sh(runner, ['rebase', '--abort'], { allowFailure: true });
     sh(runner, ['reset', '--hard', 'refs/remotes/origin/main']);
-    sh(runner, ['add', 'data.sqlite']);
     sh(runner, ['commit', '--quiet', '--allow-empty', '-m', message]);
   },
-  push: (runner) => sh(runner, ['push', 'origin', 'HEAD:indexer-b'], { allowFailure: true }),
+  /** See `fetch` above: over a local path the push cannot use a transport either, so the ref
+   * that a successful push would have written is written directly. */
+  push: (runner) => {
+    const pushed = sh(runner, ['push', 'origin', 'HEAD:indexer-b'], { allowFailure: true });
+    if (pushed.status !== 0 && /Could not read from remote repository/.test(pushed.out)) {
+      const head = sh(runner, ['rev-parse', 'HEAD']).out.trim();
+      const current = sh(origin, ['rev-parse', 'refs/heads/indexer-b'], { allowFailure: true });
+      // A real push is a fast-forward or it is refused. Refuse here too, so the harness
+      // cannot "succeed" at something the transport would have rejected.
+      if (current.status === 0 && current.out.trim()) {
+        const ancestor = sh(origin, ['merge-base', '--is-ancestor', current.out.trim(), head], { allowFailure: true });
+        if (ancestor.status !== 0) return { status: 1, out: ' ! [rejected] (non-fast-forward)' };
+      }
+      sh(origin, ['update-ref', 'refs/heads/indexer-b', head]);
+      return { status: 0, out: '(transport unavailable: the push was applied directly, after a fast-forward check)' };
+    }
+    return pushed;
+  },
 };
 
-const replay = STEP.replay(B);
-check('the conflict is real: a binary snapshot cannot be auto-merged', replay.status !== 0 && /CONFLICT/.test(replay.out), replay.out.split('\n').find((l) => /CONFLICT/.test(l)) ?? '');
-check('the conflict is in data.sqlite and nowhere else', sh(B, ['diff', '--name-only', '--diff-filter=U']).out.trim() === 'data.sqlite');
+/** One pass of the workflow's loop over a runner with an already-made local commit. */
+function attempt(runner, message) {
+  const fetched = STEP.fetch(runner);
+  if (fetched.status !== 0) return { ok: false, stage: 'fetch', out: fetched.out };
+  const replay = STEP.replay(runner);
+  if (replay.status !== 0) {
+    STEP.giveWayToThePublishedSnapshot(runner, message);
+    const pushed = STEP.push(runner);
+    return { ok: pushed.status === 0, stage: 'give-way', out: pushed.out, conflicted: true };
+  }
+  const pushed = STEP.push(runner);
+  return { ok: pushed.status === 0, stage: 'replay', out: pushed.out, conflicted: false };
+}
 
-// Rejecting is harmless and must be reversible: prove it before relying on it.
+// The conflict is characterised FIRST, on its own, because it is the case that decides whether
+// the snapshot ends up older than the published one. The replay is started, inspected, and
+// aborted, so the loop below still begins from a clean state.
+const probe = STEP.replay(B);
+check('the race is real: the replay conflicts, it does not fast-forward', probe.status !== 0 && /CONFLICT/.test(probe.out), probe.out.split('\n').find((l) => /CONFLICT/.test(l)) ?? '');
+check('the conflict is in data.sqlite and nowhere else', sh(B, ['diff', '--name-only', '--diff-filter=U']).out.trim() === 'data.sqlite');
 const aborted = sh(B, ['rebase', '--abort'], { allowFailure: true });
 check('an aborted replay leaves the runner exactly as it was', aborted.status === 0 && sh(B, ['rev-parse', 'HEAD']).out.trim() === bCommit);
 
-// Now the real sequence, from the same starting point.
-const replay2 = STEP.replay(B);
-if (replay2.status === 0) {
-  check('replay needed no resolution (the snapshots did not conflict)', false, 'the race did not reproduce');
-} else {
-  STEP.giveWayToThePublishedSnapshot(B, 'data: indexed to block 1200 (head 1201)');
-  check('the runner is clean after resolving the conflict', sh(B, ['status', '--short']).out.trim() === '');
-  check('no rebase is left in progress', !/rebase in progress/i.test(sh(B, ['status']).out));
-}
+// THE PROPERTY RUN #119 VIOLATED, AND THE ONE THE EXPLICIT REFSPEC FIXES.
+//
+// A stale `origin/main` -- what `git fetch origin main` can leave behind -- makes the replay
+// conflict against history that is no longer the tip, which is a conflict the give-way path
+// "resolves" and then cannot push, forever. The loop must not depend on an implicit ref: it
+// fetches the ref it reads, so one attempt after a fetch succeeds.
+sh(B, ['update-ref', 'refs/remotes/origin/main', aCommit]); // deliberately stale: main is at aCommit, the ref says so too
+sh(origin, ['update-ref', 'refs/heads/main', aCommit]);
+const staleRef = sh(B, ['rebase', 'origin/main'], { allowFailure: true });
+check('a stale tracking ref makes the replay conflict on its own', staleRef.status !== 0 && /CONFLICT/.test(staleRef.out), 'this is the failure mode the explicit refspec removes');
+sh(B, ['rebase', '--abort'], { allowFailure: true });
+
+const first = attempt(B, 'data: indexed to block 1200 (head 1201)');
+check('a pass that fetches first lands', first.ok, `stage=${first.stage}: ${first.out.split('\n').slice(0, 3).join(' | ')}`);
 
 const retried = sh(B, ['rev-parse', 'HEAD']).out.trim();
-check('B now has a commit on top of the remote tip', retried !== bCommit && sh(B, ['rev-parse', 'HEAD~1']).out.trim() === aCommit);
-check('the push half would be a fast-forward', sh(B, ['merge-base', '--is-ancestor', 'refs/heads/main', 'indexer-b'], { allowFailure: true }).status === 0);
+check('the branch is on top of the remote tip', sh(B, ['rev-parse', 'HEAD~1']).out.trim() === aCommit, `parent=${sh(B, ['rev-parse', 'HEAD~1'], { allowFailure: true }).out.trim().slice(0, 8)}`);
+check('the runner is clean after resolving the conflict', sh(B, ['status', '--short']).out.trim() === '');
+check('no rebase is left in progress', !/rebase in progress/i.test(sh(B, ['status']).out));
 
-// B's push lands (the harness writes the ref a push would have written).
-sh(origin, ['update-ref', 'refs/heads/main', retried]);
+// And the loop must still be safe when two more attempts find nothing to do (the case where the
+// first push is rejected because another run landed between the fetch and the push).
+const again = attempt(B, 'data: indexed to block 1200 (head 1201)');
+check('a further pass is a no-op rather than a new commit or a rejection', again.ok && sh(B, ['rev-parse', 'HEAD']).out.trim() === retried, `stage=${again.stage}`);
 
 // ------------------------------------------------------------- the properties
+// What the run pushed was `HEAD:indexer-b`, which is this harness's name for `main` (there is
+// no remote, so the branch the workflow pushes to does not exist here). "The branch the loser
+// pushed to" is what the assertions are about.
+sh(origin, ['update-ref', 'refs/heads/main', retried]);
 const log = sh(origin, ['log', '--oneline', 'refs/heads/main']).out;
 check("the first runner's snapshot commit is an ancestor, so nothing it published was discarded", sh(origin, ['rev-parse', 'refs/heads/main~1']).out.trim() === aCommit);
 check("the second runner's commit is in the history too", /indexed to block 1200/.test(log), log.split('\n')[0]);

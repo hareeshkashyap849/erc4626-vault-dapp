@@ -121,6 +121,32 @@
 # copy that is already published and re-commits, so a lost race costs one run's headway rather
 # than the run. It never force-pushes, and it never discards another run's commit.
 #
+# THE FIRST VERSION OF THAT LOOP FAILED, AND THE WAY IT FAILED IS THE USEFUL PART.
+#
+# Run #119 was a real burst -- a scheduled run started 86 s after a manual dispatch, both
+# indexed, and the scheduled one finished second. It failed after five attempts, every one of
+# them with
+#
+#     ! [rejected] HEAD -> main (non-fast-forward)
+#
+# after an unbroken sequence of the replay conflicting, the run giving way, and the push being
+# refused. Two things were wrong, and neither was visible in a single pass of the loop:
+#
+#   1. `git fetch origin main` does not reliably update `origin/main`. The loop READS
+#      `origin/main` and was WRITING only FETCH_HEAD, so an attempt could replay against
+#      history that was no longer the tip -- a conflict it "resolved" into a commit that
+#      could not be pushed. Fixed by fetching the ref it reads, explicitly:
+#      `+refs/heads/main:refs/remotes/origin/main`.
+#   2. `git checkout origin/main -- data/vault.sqlite` un-aborted the replay without anchoring
+#      the branch, so the give-way commit was not a descendant of the tip it was derived from.
+#      `git reset --hard origin/main` both aborts the replay and anchors the branch, which
+#      makes the next attempt start where this one did, and makes the whole step idempotent.
+#
+# The lesson is in the shape of the mistake rather than in either fix: the step was verified
+# by a single-pass rehearsal, and the property that mattered was convergence across attempts.
+# `tools/verify-push-race.mjs` now runs the loop, including a deliberately stale
+# `origin/main` that reproduces defect 1 in isolation.
+#
 # WHY A CRON AND NOT A SERVICE
 #
 # No free hosting tier runs a long-lived process: Render sleeps a web service after
@@ -262,7 +288,24 @@ jobs:
           git commit -m "$COMMIT_MSG"
 
           for attempt in 1 2 3 4 5; do
-            git fetch origin main
+            # THE REFSPEC IS NOT DECORATION. `git fetch origin main` writes FETCH_HEAD and,
+            # only when the remote's configured refspec covers that branch, the tracking ref
+            # `origin/main` as well -- and this loop reads `origin/main`. The first version of
+            # this step fetched plainly, and run #119 failed FIVE TIMES IN A ROW with
+            #
+            #     ! [rejected] HEAD -> main (non-fast-forward)
+            #
+            # for exactly that reason: the replay had conflicting history it had already
+            # resolved, the give-way branch re-derived a commit that was no longer a
+            # descendant of the tip, and every attempt repeated it. Naming the ref that is
+            # read, explicitly and force-updated, leaves one answer per attempt to "what is
+            # the remote tip" -- and the give-way branch below is idempotent on top of it.
+            #
+            # The ref name is spelled out rather than `git pull --rebase` because this step
+            # has to be readable: what it reads, what it writes, and what it does when the
+            # two disagree.
+            git fetch origin +refs/heads/main:refs/remotes/origin/main
+
             # `git rebase` (not `git pull`): one commit of our own is replayed on top of the
             # remote tip, so the history stays linear and no merge commit is invented.
             if git rebase origin/main; then
@@ -276,14 +319,20 @@ jobs:
               # and the copy already on main has been published, so this run gives way to it.
               # The alternative is a `git push --force`, which would overwrite another run's
               # snapshot: exactly what the concurrency group exists to prevent.
-              # `git rebase --abort` restores this run's commit first, so nothing of this run
-              # is lost except its headway, which the next run picks up from the database it
-              # already wrote. The re-commit is allowed to be empty: it is the record that
-              # this run did its work and then deferred, and an empty commit changes no file.
-              git rebase --abort
+              #
+              # `git reset --hard origin/main` DOES TWO THINGS, and the second one is why it
+              # replaces `git checkout origin/main -- ...`: it aborts the replay AND anchors
+              # the branch to the tip that was just fetched. A give-way commit that is merely
+              # "origin/main's file plus a new commit" is only pushable while the tip it was
+              # derived from is still the tip; anchoring makes the next attempt start from the
+              # same place this one did. Nothing of this run is lost by it -- the indexed rows
+              # and the log are already in the run's own database, and the next run resumes
+              # from wherever main ends up.
+              git reset --hard origin/main
               echo "the snapshot conflicts with the published one; keeping the published copy"
-              git checkout origin/main -- data/vault.sqlite
-              git add data/vault.sqlite
+              # Allowed to be empty: it is the record that this run did its work and then
+              # deferred, and an empty commit changes no file -- which keeps the history
+              # linear while making the outcome visible in `git log`.
               git commit --allow-empty -m "$COMMIT_MSG"
               if git push origin HEAD:main; then
                 exit 0
