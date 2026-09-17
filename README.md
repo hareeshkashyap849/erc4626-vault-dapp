@@ -7,6 +7,19 @@ The vault it indexes lives in
 [`erc4626-vault`](https://github.com/hareeshkashyap849/erc4626-vault) — the contract,
 its Foundry tests, the deployment scripts, `deployments/`, and the wallet dApp.
 
+## What is public, and what is not
+
+Stated up front, because "where can I see it running" is the first question a service has to
+answer:
+
+| | |
+|---|---|
+| **The index this service produces** | committed at `data/vault.sqlite` and written to be kept current by a scheduled workflow (`.github/workflows/index.yml`, every 5 minutes). It holds the Base Sepolia index: `chain_id` 84532, starting exactly at the deployment block 46,919,124, including the real `Deposit` at 46,919,498. **Whether that workflow has actually run is not something this file can establish** — the run history is the place to check it, and a cron that has never fired is a plan rather than a fact. |
+| **This service itself** | **not hosted.** No free tier runs a long-lived process, so the design is a scheduled catch-up that commits its snapshot rather than a resident server. That is why the workflow exists and why the snapshot is committed at all. |
+| **The front end that reads it** | the console at <https://hareeshkashyap849.github.io/vault-console/> is published as a static export, so it has **no route to this service** and says so on the history page. Pointing its `indexApiUrl` at a hosted instance of this API is the change that would light that page up. |
+| **What can be checked without running anything** | the committed snapshot (open it with `node:sqlite`), the workflow's run history, and `verify-data.ts`, which reconciles the index against the chain. |
+
+
 ## Why this is a separate repository
 
 By **language and deployment surface**, not by "contract vs front end":
