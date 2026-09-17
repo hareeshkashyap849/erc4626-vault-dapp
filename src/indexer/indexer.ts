@@ -31,6 +31,7 @@
 import type { RpcClient, BlockHeader } from '../lib/rpc.ts';
 import type { Store, VaultEventRow, ShareTransferRow, VaultSnapshotRow } from '../lib/db.ts';
 import { TOPICS, decodeVaultLog, decodeShareTransfer, assertTopics, type RawLog } from '../lib/decode.ts';
+import { decodeUintResult } from '../lib/rpc.ts';
 
 export interface IndexerConfig {
   vault: string;
@@ -364,6 +365,8 @@ export class Indexer {
     // ---- one batched read per block that could have changed
     const reads = new Map<number, { assets: bigint; supply: bigint }>();
     const readFailures = new Map<number, string>();
+    /** Blocks where the node answered successfully with no value at all (`result: "0x"`). */
+    let emptyResults = 0;
     const wanted = numbers.filter((n) => changed.has(n));
     const perChunk = 50;
 
@@ -378,14 +381,26 @@ export class Indexer {
       chunk.forEach((blockNumber, index) => {
         const assetsEntry = results[index * 2]!;
         const supplyEntry = results[index * 2 + 1]!;
-        if ('result' in assetsEntry && 'result' in supplyEntry) {
-          reads.set(blockNumber, { assets: BigInt(assetsEntry.result), supply: BigInt(supplyEntry.result) });
-        } else {
+        const assets = decodeUintResult(assetsEntry);
+        const supply = decodeUintResult(supplyEntry);
+        if (assets !== null && supply !== null) {
+          reads.set(blockNumber, { assets, supply });
+        } else if (!('result' in assetsEntry) || !('result' in supplyEntry)) {
           // The ERROR goes in the log. The first version recorded only "unreadable",
           // which is not a diagnosis: it took a separate investigation to learn that
           // every read was failing for one reason the log had thrown away.
           const first = 'error' in assetsEntry ? assetsEntry.error : (supplyEntry as { error: { code: number; message: string } }).error;
           readFailures.set(blockNumber, `${first.code} ${first.message}`);
+        } else {
+          /**
+           * A SUCCESS WITH NO VALUE. `result: "0x"` is what a node answers when the contract is not part
+           * of the state it serves for that height -- see `decodeUintResult`. It is counted and logged
+           * rather than folded into the failures, because it is not a failure and it is not zero: the
+           * walk forward below treats it exactly like a failed read, deriving from events or carrying the
+           * previous totals, and the count says how often that happened.
+           */
+          emptyResults += 1;
+          readFailures.set(blockNumber, 'empty result (0x): the vault is not in the state this node serves for that block');
         }
       });
     }
@@ -431,7 +446,8 @@ export class Indexer {
         'series-derived',
         `${derived} changing block(s) could not be read and were derived from events; ` +
           `${carriedForward} unchanged block(s) carried forward; ${skipped} skipped for want of a baseline; ` +
-          `first readable block ${firstRealRead ?? 'none'}` +
+          `${emptyResults} answered successfully with no value (a node that does not hold the contract at ` +
+          `that height); first readable block ${firstRealRead ?? 'none'}` +
           (unreadable.length ? `; e.g. block ${unreadable[0]}: ${readFailures.get(unreadable[0]!)}` : ''),
       );
     }

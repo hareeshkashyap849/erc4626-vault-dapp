@@ -219,3 +219,30 @@ export class RpcClient {
     };
   }
 }
+
+/**
+ * A uint256 from an `eth_call` result, or `null` when the call returned nothing.
+ *
+ * A JSON-RPC SUCCESS WITH AN EMPTY RESULT IS NOT A ZERO, AND IT IS NOT A NUMBER EITHER.
+ *
+ * Found by deploying the vault to Base Sepolia for real. The indexer's first block IS the deployment
+ * block, and a public node asked for the vault's `totalAssets` at that exact height answers
+ * `result: "0x"` -- the contract exists by the end of that block, but the state the node serves for the
+ * call does not contain it. `BigInt('0x')` then throws `Cannot convert 0x to a BigInt`, and the indexer
+ * dies on the first block of its range: a fresh deployment could not be indexed at all.
+ *
+ * `null` means "this was not read", and the caller must treat it as a missing measurement -- NOT as
+ * zero. Zero is a claim about the vault; an empty result is a statement about the node. Collapsing the
+ * two would write a fabricated `totalAssets: 0` into the series for every block a node declines to
+ * answer for, which is exactly the class of error this project exists to avoid.
+ */
+export function decodeUintResult(entry: { result?: unknown; error?: unknown } | undefined): bigint | null {
+  const raw = entry?.result;
+  if (typeof raw !== 'string' || raw === '' || raw === '0x') return null;
+  try {
+    return BigInt(raw);
+  } catch {
+    // A non-hex value is not a number this code can use, and inventing one would be worse than a gap.
+    return null;
+  }
+}
