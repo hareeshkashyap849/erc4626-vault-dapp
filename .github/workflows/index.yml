@@ -33,6 +33,78 @@
 # The run history is the place. This is the record of what was measured on the date above, not
 # a claim about now.
 #
+# WHY THE NUMBERS ARE WHAT THEY ARE
+#
+# THE INTERVAL IS NOT FIVE MINUTES, AND EVERY PARAMETER HERE IS SIZED AGAINST THE INTERVAL
+# THAT IS MEASURED RATHER THAN THE ONE THAT WAS ASKED FOR.
+#
+# The cron below asks for `*/5`. GitHub's scheduler did not deliver it, and this is measured
+# from the run history, not read off a dashboard: across the scheduled runs #93..#107, the
+# gaps between consecutive runs were 15.4, 16.3, 17.0, 17.1, 18.6, 19.1, 20.1, 21.3, 22.4,
+# 23.2, 23.6, 27.5 minutes (mean 19.4, median 19.1; the shortest gap over the 20 runs read
+# was 12.7). "Every 5 minutes" is a lower bound that GitHub makes no promise about, and a
+# workflow that cannot ask for anything shorter must not assume anything shorter either.
+#
+# Why that changes the parameters: Base produces a block every 2.000 seconds, so the nominal
+# 5-minute interval would produce 150 blocks, while a real one produces 460-825 blocks
+# (the median gap 19.1 min = 573, the worst gap 27.5 min = 825). A bound BELOW one interval
+# is not a slower catch-up, it is a guaranteed net loss on every run, forever:
+#
+#   MAX_CATCHUP_BLOCKS was 300 -> the median interval produces 573 blocks and a run scanned
+#   300 -> the gap grew by ~273 blocks between scheduler chances, with every run reporting
+#   success and exiting 0. Measured on the two runs that did land: two green runs advanced the
+#   snapshot by exactly 600 blocks (46,919,979 -> 46,920,579) while the head advanced 490
+#   (46,946,749 -> 46,947,239), and the gap was still 26,259 and growing.
+#
+# That is the third time this project has chosen a pair of bounds that are jointly impossible,
+# in a third way. The first two are kept below, because the pattern is the point: each time,
+# both numbers looked reasonable on their own, and each time the error was the same -- a
+# parameter sized against a nominal quantity (a 30-minute cron, a 5-minute cron) instead of a
+# measured one.
+#
+# THE ARITHMETIC, from the measurements:
+#
+#   MAX_CATCHUP_BLOCKS = 3000
+#     one real scheduler interval produces 460-825 blocks, so 3000 leaves 2175-2540 blocks of
+#     headroom; it takes 3000 / 20.5 = 146 s to scan at the rate the runner measured
+#     (300 blocks in 14,654 ms, run #108), against 573 blocks produced per median interval --
+#     so the net drain is ~2427 blocks per interval, and the 26,612-block backlog measured on
+#     2026-09-17 is ~11 intervals, about 3.5 hours, as opposed to never.
+#
+#   MAX_CATCHUP_SECONDS = 450
+#     this is a CEILING, not a target. It must not be the bound that decides a healthy run:
+#     the conversion is `seconds x scan rate` (src/indexer/bounds.ts), the rate is the last
+#     run's measured one, and 450 x 20.5 = 9225 blocks is far above the 3000 the block bound
+#     allows, so the block bound decides. It must also fit the job: this job has
+#     `timeout-minutes: 10`, checkout + tests + record fetch measured 45 s, so 450 + 45 = 495 s
+#     of the 600 available, and a run that hits the ceiling still commits rather than being
+#     killed mid-scan. On a first, cold run -- no history, so the conservative 4 blocks/s
+#     default applies -- the ceiling allows 1800 blocks, which is deliberately the bound that
+#     decides until a rate has been measured.
+#
+#   Why not 6000: the same arithmetic gives 293 s at the runner's rate, and 293 + 45 + a push
+#     is inside 600 s only if the endpoint holds that rate for a 3x larger range, which has not
+#     been measured. 3000 is the largest value the measurements support; a bound that
+#     overruns the job timeout is worse than a smaller one, because it commits nothing.
+#
+#   Why not more runners: two runners writing one SQLite file is a corruption, not a race worth
+#     losing. The bound is how a single writer gets further per run.
+#
+# ONE WRITER AT A TIME, AND A BURST OF DISPATCHES IS NOT A FAILURE
+#
+# `concurrency: indexer` with `cancel-in-progress: false` is meant to serialise runs, and it
+# does not do so tightly enough: four dispatches inside 15 s in run #110-#112 started
+# concurrently, three were cancelled and the fourth committed locally and then failed with
+#
+#     ! [rejected] main -> main (fetch first)
+#
+# -- work that was already done, thrown away by a push that lost a race. The concurrency group
+# stays (two writers on one SQLite file is corruption), and the commit step no longer assumes
+# it won: it fetches, replays its own commit on top of whatever landed, and retries the push.
+# On a conflict in the snapshot -- a SQLite file cannot be merged, only chosen -- it keeps the
+# copy that is already published and re-commits, so a lost race costs one run's headway rather
+# than the run. It never force-pushes, and it never discards another run's commit.
+#
 # WHY A CRON AND NOT A SERVICE
 #
 # No free hosting tier runs a long-lived process: Render sleeps a web service after
@@ -41,32 +113,34 @@
 # than from a preference. The vault repository's ARCHITECTURE.md section 7 records
 # the plan and the measurements behind its parameters.
 #
-# WHY THE NUMBERS ARE WHAT THEY ARE
+# THE TWO EARLIER MISTAKES WITH THESE PARAMETERS, KEPT ON PURPOSE
 #
-# Base produces a block every 2.000 seconds, measured. A 5-minute cron therefore
-# covers 150 blocks, and MAX_CATCHUP_BLOCKS is 300 -- a 2x margin. Those two numbers
-# and MAX_CATCHUP_SECONDS were WRONG in the first version of the plan in a way worth
-# repeating here: a 30-minute cron with a 300-block bound can never close a 30-minute
-# gap, so every catch-up would have timed out and the deployment would have been a
-# snapshot that was permanently 30 minutes stale, with catch-up code present and
-# never working. Two timer parameters can each look sane and be jointly impossible.
+#   1. A 30-minute cron with a 300-block bound. A 30-minute gap is more than 300 blocks, so
+#      every catch-up would have timed out and the deployment would have been a snapshot that
+#      was permanently 30 minutes stale, with catch-up code present and never working.
+#   2. `MAX_CATCHUP_SECONDS = 20`, chosen from measuring what a 300-block catch-up costs in
+#      wall clock -- the right question -- while the code converted that budget into blocks
+#      using the CHAIN's 2.000 s block time, so 20 seconds meant 9 blocks against the 150 a
+#      cron interval produces. Measured with those exact values: one run indexed 9 blocks and
+#      reported TRUNCATED while the head advanced 58 blocks in the 90 seconds before it. Every
+#      run looked successful and the snapshot fell further behind on every one. The conversion
+#      is fixed (see src/indexer/bounds.ts) and the budget is a ceiling rather than a target.
+#   3. `MAX_CATCHUP_BLOCKS = 300`, which was below one REAL scheduler interval as measured
+#      above: 300 scanned against 460-825 produced. Two successful runs advanced the snapshot
+#      by exactly 600 blocks while the chain added 742, and the gap grew from 25,700 to 26,612
+#      with nothing but green runs to look at.
 #
-# THE SAME MISTAKE WAS THEN MADE AGAIN, IN THE OTHER DIRECTION, and only a real run
-# showed it. MAX_CATCHUP_SECONDS was 20, chosen from measuring what a 300-block
-# catch-up costs in wall clock; but the indexer converted that budget into blocks
-# using the CHAIN's 2.000 s block time, so 20 seconds meant 9 blocks against the 150
-# a cron interval produces. Measured with these exact values: one run indexed 9
-# blocks and reported TRUNCATED while the head advanced 58 blocks in the 90 seconds
-# before it. That is a snapshot that falls further behind every 5 minutes while every
-# run looks successful. The conversion is fixed (see src/indexer/bounds.ts) and the
-# budget is now one cron interval, so the block bound is the one that binds: at the
-# measured 4.8 blocks/s, 300 s allows about 1,400 blocks.
+# WHAT THIS COMMENT CANNOT ESTABLISH, AND WHERE TO CHECK IT: whether recent runs are green,
+# and whether the gap is closing. The run history and `last_indexed_block` are the places.
+# This is the record of what was measured on the dates above, not a claim about now.
 name: index
 
 on:
   schedule:
-    # Every 5 minutes. GitHub's scheduler can lag under load, which is what the 2x
-    # block margin is for.
+    # Every 5 minutes, as asked for. MEASURED: GitHub delivers roughly every 15-27 minutes
+    # under load (median 19.1), which is why MAX_CATCHUP_BLOCKS is sized against 19 minutes
+    # of chain and not against 5. GitHub gives no cron interval shorter than 5 minutes, so
+    # the spacing cannot be improved from here -- only the per-run bound can.
     - cron: '*/5 * * * *'
   # Manual runs, for when a catch-up is wanted immediately.
   workflow_dispatch:
@@ -74,7 +148,7 @@ on:
       max_blocks:
         description: 'Maximum blocks to scan this run'
         required: false
-        default: '300'
+        default: '3000'
 
 # The job commits the snapshot, so it needs write access. Scoped to this workflow.
 permissions:
@@ -122,23 +196,42 @@ jobs:
           DEPLOYMENT_RECORD: deployments/base-sepolia.json
           DATABASE_PATH: data/vault.sqlite
           RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
-          MAX_CATCHUP_BLOCKS: ${{ github.event.inputs.max_blocks || '300' }}
-          # One cron interval, so the time bound cannot become the binding constraint.
-          MAX_CATCHUP_SECONDS: '300'
+          # 3000 blocks: 2175-2540 of headroom over the 460-825 a real scheduler interval
+          # produces, and 146 s of scanning at the rate the runner measured. See the header.
+          MAX_CATCHUP_BLOCKS: ${{ github.event.inputs.max_blocks || '3000' }}
+          # A ceiling, not a target: 450 x the measured 20.5 blocks/s is 9225 blocks, well
+          # above the block bound, so the block bound is what decides a healthy run. It is
+          # 450 rather than 300 because at the conservative first-run rate of 4 blocks/s the
+          # budget has to stay above one real interval, and 450 + 45 s of setup is still
+          # inside the job's 10-minute timeout. See the header for the whole arithmetic.
+          MAX_CATCHUP_SECONDS: '450'
         run: node --experimental-strip-types src/indexer/cli.ts --verbose
 
       # Committed rather than cached: a cache is evicted and a snapshot that vanishes
       # is a snapshot that has to be rebuilt from the deployment block, which on a
       # public endpoint is slow and possibly not permitted at all.
+      #
+      # AND COMMITTED IN A WAY THAT SURVIVES ANOTHER RUN PUSHING FIRST. `concurrency:
+      # indexer` is not a strict serialiser: four dispatches inside 15 s in runs #110-#112
+      # ran concurrently, and the one that finished last committed locally and then died on
+      #
+      #     ! [rejected] main -> main (fetch first)
+      #
+      # -- a run failing with its work already done. So the push is no longer the last
+      # statement of the step: it is the last statement of a loop that fetches first, replays
+      # this run's one commit on top of whatever landed, and retries. Every attempt can only
+      # move the branch forward, and a rejected push is retried rather than fatal.
       - name: Commit the snapshot if it changed
         run: |
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
           git add data/vault.sqlite
           if git diff --staged --quiet; then
             echo "no change this run"
             exit 0
           fi
+
           # The block range goes in the message so the history of the snapshot is
           # readable from `git log` without opening the database.
           SUMMARY=$(node --experimental-strip-types -e "
@@ -148,5 +241,40 @@ jobs:
             const n = db.prepare('SELECT COUNT(*) AS n FROM vault_events').get().n;
             console.log(\`indexed to block \${s.last_indexed_block} (head \${s.chain_head_at_last_run}), \${n} events\`);
           ")
-          git commit -m "data: $SUMMARY"
-          git push
+          COMMIT_MSG="data: $SUMMARY"
+          git commit -m "$COMMIT_MSG"
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            # `git rebase` (not `git pull`): one commit of our own is replayed on top of the
+            # remote tip, so the history stays linear and no merge commit is invented.
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                exit 0
+              fi
+              echo "push was rejected on attempt $attempt; the remote moved, retrying"
+            else
+              # A conflict here can only be `data/vault.sqlite`: it is a binary file and both
+              # runs wrote different bytes. A SQLite snapshot cannot be merged, only chosen --
+              # and the copy already on main has been published, so this run gives way to it.
+              # The alternative is a `git push --force`, which would overwrite another run's
+              # snapshot: exactly what the concurrency group exists to prevent.
+              # `git rebase --abort` restores this run's commit first, so nothing of this run
+              # is lost except its headway, which the next run picks up from the database it
+              # already wrote. The re-commit is allowed to be empty: it is the record that
+              # this run did its work and then deferred, and an empty commit changes no file.
+              git rebase --abort
+              echo "the snapshot conflicts with the published one; keeping the published copy"
+              git checkout origin/main -- data/vault.sqlite
+              git add data/vault.sqlite
+              git commit --allow-empty -m "$COMMIT_MSG"
+              if git push origin HEAD:main; then
+                exit 0
+              fi
+              echo "push was rejected after giving way on attempt $attempt; retrying"
+            fi
+            sleep $((attempt * 5))
+          done
+
+          echo "::error::could not push the snapshot after 5 attempts; another run is writing this branch"
+          exit 1

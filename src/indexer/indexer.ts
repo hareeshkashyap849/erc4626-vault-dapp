@@ -147,8 +147,12 @@ export class Indexer {
   async run(options: RunOptions = {}): Promise<RunResult> {
     const started = options.now ? options.now() : Date.now();
     const now = options.now ?? (() => Date.now());
-    const maxBlocks = options.maxBlocks ?? 300;
-    const maxSeconds = options.maxSeconds ?? 20;
+    // Fallbacks only: the CLI always passes `config.maxCatchupBlocks`/`maxCatchupSeconds`,
+    // and so does the API. They are set to the same numbers as `src/config.ts` so that a
+    // caller which forgets them does not silently get the old, too-small bound -- the bound
+    // whose 300 blocks could not outrun even one scheduler interval. See `src/config.ts`.
+    const maxBlocks = options.maxBlocks ?? 3000;
+    const maxSeconds = options.maxSeconds ?? 450;
     const confirmations = options.confirmations ?? 0;
 
     this.verifyTopics(options.keccak256);

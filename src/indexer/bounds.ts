@@ -24,17 +24,50 @@
 /**
  * Blocks scanned per second of wall clock, when nothing has been measured yet.
  *
- * MEASURED, TWICE, AGAINST A PUBLIC ENDPOINT -- and the lower figure is used:
+ * MEASURED FOUR TIMES AGAINST A PUBLIC ENDPOINT, AND THE LOWEST FIGURE IS USED.
  *
- *   * 111 blocks in 23,069 ms -> 4.8 blocks/s (a larger range)
- *   * 29 blocks in 1,958 ms   -> 14.8 blocks/s (a smaller range; the fixed ~1.2 s
- *     startup is spread over fewer blocks, so this rate is flattered)
+ * Against `sepolia.base.org`, from the runner the scheduled workflow uses (`src/config.ts`
+ * quotes the run this came from):
  *
- * The rate falls as the range grows, which is the opposite of what an optimistic
- * constant would assume, so the worst measurement is the one that is used and it is
- * rounded DOWN to 4 blocks/s: a budget is converted with 4 blocks/s, and a run therefore
- * stops earlier than it could have. Stopping early costs a cron interval; over-running a
- * budget is what the bound exists to prevent.
+ *   * 300 blocks in 14,654 ms -> 20.5 blocks/s (run #108; a small range, so the fixed
+ *     startup cost is spread over few blocks and this rate is FLATTERED)
+ *
+ * Against the same endpoint from this development machine, on a database built from
+ * scratch, which is the slower of the two environments:
+ *
+ *   * 718 blocks in 196,875 ms -> 3.65 blocks/s (the cold-start path, measured 2026-09-18)
+ *   * 300 blocks in  81,613 ms -> 3.68 blocks/s (the same range as run #108, same
+ *     conditions except the machine: 5.6x slower than the runner)
+ *   * 111 blocks in 23,069 ms  -> 4.8 blocks/s (the original measurement, a smaller range)
+ *
+ * The two environments differ by more than 5x and this repository does not contain the
+ * measurement that would explain it, so the rule is applied literally: the conversion uses
+ * the LOWEST rate measured anywhere, and 3.65 rounds DOWN to 4 at the one-significant-figure
+ * precision the rest of this arithmetic uses. Rounding up to 5 would be a claim no
+ * measurement supports; rounding down to 3 would over-state the cost by 20%, and the cost of
+ * under-stating a rate is only that a run stops earlier than it could have.
+ *
+ * WHAT THIS MEANS FOR THE WORKFLOW'S BOUNDS, AND THE LIMIT OF WHAT A FLOOR CAN DO
+ *
+ * The floor rate is used to convert `maxCatchupSeconds` into blocks when a run has no history
+ * to measure from. At the workflow's 450 s budget and this rate that is 1800 blocks against a
+ * 3000-block bound, so a first, cold run is stopped by the TIME bound, not by the block bound.
+ * Keeping the floor at 4 rather than raising it to 7.5 -- the rate at which a 450 s budget
+ * would exactly match a 3000-block bound -- is deliberate, and it is the conservative choice
+ * for a specific failure: under-stating the rate makes a run stop EARLY, which costs one
+ * scheduler interval and is recorded as TRUNCATED; over-stating it makes a run overshoot the
+ * job's 10-minute timeout, which is a run killed mid-scan with nothing committed at all. The
+ * first failure is the one this bound exists to produce.
+ *
+ * From the second run onward the rate is the PREVIOUS run's measured rate
+ * (`scanRateFromHistory` writes it into the log and reads it back), so the runner's own
+ * measurement -- 20.5 blocks/s, which converts 450 s into 9225 blocks -- is what applies, and
+ * the 3000-block bound is what decides. That is the intended shape: the time bound is a
+ * ceiling for a slow endpoint or a cold start, and the block bound governs a warm run.
+ *
+ * The original mistake this file exists to prevent -- converting the budget at the CHAIN's
+ * block time, which made 20 s mean 9 blocks -- is preserved in the workflow header and in
+ * `test/bounds.test.ts`, because it is the reason the conversion is at a scan rate at all.
  */
 export const DEFAULT_SCAN_BLOCKS_PER_SECOND = 4;
 

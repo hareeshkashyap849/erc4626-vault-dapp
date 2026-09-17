@@ -47,18 +47,60 @@ export interface Config {
 
 const DEFAULTS = {
   apiPort: 8787,
-  // A 5-minute cron covers 150 blocks at Base's measured 2.000 s block time. 300 is
-  // a 2x margin, and it is the bound that should bind on a healthy endpoint.
+  // HOW MANY BLOCKS ONE RUN MAY COVER, AND WHY IT IS 3000.
   //
-  // THE TIME BOUND USED TO BE 20 SECONDS AND THAT WAS WRONG. 20 was chosen from a
+  // The number to size this against is NOT the nominal cron interval. This workflow asks
+  // for `*/5`, and the scheduler does not deliver it: measured across scheduled runs #93 to
+  // #107, consecutive runs were 15.4 to 27.5 minutes apart, median 19.1 (17-18 typical).
+  // Base produces a block every 2.000 s, so the median interval produces 573 blocks and the
+  // worst gap produces 825. A run may reach for 3000: 2427 blocks of headroom on the median
+  // interval, and still 2175 on the longest gap measured.
+  //
+  // 300 WAS BELOW ONE INTERVAL. At 300 the bound covered 10 minutes of chain, so every run
+  // fell behind by at least 160 blocks and as much as 525 -- the snapshot could not catch up
+  // by design, which is what a measured 26,612-block backlog looked like.
+  //
+  // 3000 FITS THE JOB'S OWN LIMIT. The workflow's job has `timeout-minutes: 10`, of which
+  // checkout, the test suite and the deployment-record fetch take about 45 s measured, so a
+  // run is boxed in at roughly 555 s and takes 3000 blocks in 146 s at the 20.5 blocks/s
+  // measured on the runner (300 blocks in 14.6 s, run #108) -- about 190 s including the
+  // setup, against a 600 s ceiling.
+  //
+  // THE TIME BOUND IS STILL 450 SECONDS, AND THE TIME BOUND IS STILL NOT THE ONE THAT BINDS.
+  //
+  // `maxCatchupSeconds` is a safety net for a slow endpoint, not a throughput target, so it
+  // is set to the largest value that still leaves the job inside its own timeout. The
+  // conversion is `blocks = seconds x scan rate` (see src/indexer/bounds.ts), and the rate
+  // that conversion uses is the one the LAST RUN MEASURED, falling back to a conservative 4
+  // blocks/s on a first run. So:
+  //
+  //   450 s x 4 blocks/s   = 1800 blocks  (floor: a slow endpoint stops the run early)
+  //   450 s x 20.5 blocks/s = 9225 blocks (runner rate: the 3000-block bound decides)
+  //
+  // and 450 s + ~45 s of setup is 495 s of the 600 s the job has. It was 300 s, which at the
+  // measured runner rate allows 6150 blocks -- above the 3000 bound, so 300 would still have
+  // left the block bound in charge. It is 450 because the seconds budget is what bounds a run
+  // on a SLOW endpoint, and 3000 blocks needs 3000/4 = 750 s at the floor rate, i.e. more
+  // than the job has: without the larger budget a slow endpoint would be stopped by the old
+  // 300-second ceiling at 1200 blocks and the larger block bound would never be reached.
+  //
+  // AND THE EARLIER MISTAKE, KEPT HERE ON PURPOSE.
+  //
+  // `maxCatchupSeconds` USED TO BE 20 SECONDS AND THAT WAS WRONG. 20 was chosen from a
   // measurement of what a 300-block catch-up costs in wall clock, which was the right
-  // question; but the code converted the budget into blocks using the CHAIN's block
-  // time, so 20 s became 9 blocks and the cron fell behind by ~141 blocks every run.
-  // See src/indexer/bounds.ts. With that fixed, the budget is still set to one cron
-  // interval (300 s) so it cannot become the binding constraint again: at the measured
-  // 4.8 blocks/s that is ~1,400 blocks, far above the 300 the block bound allows.
-  maxCatchupBlocks: 300,
-  maxCatchupSeconds: 300,
+  // question; but the code converted the budget into blocks using the CHAIN's block time,
+  // so 20 s became 9 blocks against the 150 a cron interval produces. Measured with those
+  // exact values: a run scanned 9 blocks while the head advanced 58 in the 90 seconds before
+  // it. Every run looked successful and the snapshot fell further behind on every one. See
+  // src/indexer/bounds.ts -- the conversion is what was wrong, and it is now made at the
+  // rate this indexer scans rather than at the rate the chain produces blocks.
+  //
+  // Both mistakes are the same mistake: a parameter chosen against a nominal interval or a
+  // wrong unit instead of against a measured rate. The pair is only jointly possible if ONE
+  // of the two bounds is comfortably the tighter one, and that one has to be the block bound
+  // on a healthy endpoint.
+  maxCatchupBlocks: 3000,
+  maxCatchupSeconds: 450,
   confirmations: 0,
 };
 

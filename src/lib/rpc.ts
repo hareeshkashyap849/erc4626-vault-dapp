@@ -6,9 +6,11 @@
  * A catch-up pass needs a timestamp per block. Asking one block at a time is a
  * round trip each, and the vault repository's `ARCHITECTURE.md` §7.3 MEASURED the
  * difference on real Base endpoints: 437 ms for a batched timestamp call against
- * 177-317 ms PER BLOCK on the fallback. For the 300-block catch-up the plan budgets
- * for, that is the difference between about 0.65 s and about 12.5 s -- and against a
- * 20 s budget, the unbatched path is one bad endpoint away from never finishing.
+ * 177-317 ms PER BLOCK on the fallback. For a 300-block range that is the difference
+ * between about 0.65 s and about 12.5 s, and the workflow's bound has since grown to
+ * 3000 blocks: unbatched, a run of that size would spend about two minutes on headers
+ * alone and could not finish inside the job's 10-minute timeout at all. The bound in
+ * `src/config.ts` is a promise about wall clock, and this batching is what keeps it.
  *
  * ERRORS ARE RETURNED, NOT THROWN, for one specific case: a method the endpoint does
  * not support. `mainnet.base.org` does not serve batched `eth_getBlockByNumber` at

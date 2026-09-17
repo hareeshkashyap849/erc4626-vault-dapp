@@ -212,26 +212,67 @@ test('defaults are the documented ones, and the pair is internally consistent', 
 
     // THE ARITHMETIC CHECK, which is the mistake the vault repository's
     // ARCHITECTURE.md section 7.2 records: a cron interval, a block bound and a time
-    // bound can each look reasonable and be jointly impossible. Base produces a
-    // block every 2.000 s, a 5-minute cron covers 150 blocks, and the bound must
-    // cover that with margin.
-    const blocksPerCron = 300 / 2.0; // 5 minutes at 2 s per block
-    assert.ok(
-      config.maxCatchupBlocks >= blocksPerCron,
-      `maxCatchupBlocks (${config.maxCatchupBlocks}) must cover one cron interval (${blocksPerCron} blocks) or the catch-up can never close the gap`,
-    );
+    // bound can each look reasonable and be jointly impossible.
+    //
+    // The denominator is the interval the SCHEDULER DELIVERS, not the one the workflow
+    // asks for. Measured across scheduled runs #93..#107: 15.4 to 27.5 minutes apart,
+    // 17-18 typical, against a `*/5` cron. Base produces a block every 2.000 s, so the
+    // real interval produces 460-825 blocks -- and the old 300-block bound was below all
+    // of them, which is why the measured gap grew while runs succeeded.
+    const BASE_BLOCK_SECONDS = 2.0;
+    const NOMINAL_INTERVAL_SECONDS = 300;
+    const MEDIAN_INTERVAL_SECONDS = 19.1 * 60;
+    const LONGEST_MEASURED_INTERVAL_SECONDS = 27.5 * 60;
+    const blocksPerNominalCron = NOMINAL_INTERVAL_SECONDS / BASE_BLOCK_SECONDS; // 150
+    const blocksPerRealInterval = MEDIAN_INTERVAL_SECONDS / BASE_BLOCK_SECONDS; // 573
+    const blocksPerLongestGap = LONGEST_MEASURED_INTERVAL_SECONDS / BASE_BLOCK_SECONDS; // 825
 
-    // AND THE OTHER HALF OF THE PAIR, which is the half that was wrong. The block bound
+    assert.ok(
+      config.maxCatchupBlocks >= blocksPerRealInterval,
+      `maxCatchupBlocks (${config.maxCatchupBlocks}) must cover the ${blocksPerRealInterval} blocks the MEASURED ` +
+        'scheduler interval produces, or the catch-up can never close the gap',
+    );
+    assert.ok(
+      config.maxCatchupBlocks >= blocksPerLongestGap,
+      `and it must cover the longest gap measured (${blocksPerLongestGap} blocks), or a run placed after one still loses ground`,
+    );
+    // Kept as the record of what the denominator used to be: covering the nominal cron was
+    // never the requirement, and a bound that only did that was the defect.
+    assert.ok(blocksPerNominalCron < blocksPerRealInterval);
+
+    // AND THE OTHER HALF OF THE PAIR, which is the half that was wrong once. The block bound
     // above passed while the time bound allowed 9 blocks per run, because the budget was
     // converted with the chain's block time instead of the indexer's scan rate. The
-    // criterion is not "the number looks big": it is that the budget must let a run
-    // cover a whole cron interval's worth of blocks at the conservative measured rate.
-    const allowedByTime = blocksForBudget(config.maxCatchupSeconds * 1000, DEFAULT_SCAN_BLOCKS_PER_SECOND);
+    // criterion is not "the number looks big": it is that the budget must not be what stops
+    // a healthy run. Since the rate is the PREVIOUS run's measurement once there is history,
+    // the budget is checked here at the rate the runner actually measured -- 300 blocks in
+    // 14.654 s, run #108 -- and at the conservative first-run default.
+    const RUNNER_BLOCKS_PER_SECOND = 300 / 14.654;
+    const allowedByTimeOnTheRunner = blocksForBudget(config.maxCatchupSeconds * 1000, RUNNER_BLOCKS_PER_SECOND);
     assert.ok(
-      allowedByTime >= blocksPerCron,
-      `maxCatchupSeconds (${config.maxCatchupSeconds} s) allows only ${allowedByTime} blocks at the conservative ` +
-        `${DEFAULT_SCAN_BLOCKS_PER_SECOND} blocks/s, fewer than the ${blocksPerCron} a cron interval produces -- ` +
-        'the snapshot would fall further behind every run',
+      allowedByTimeOnTheRunner >= config.maxCatchupBlocks,
+      `maxCatchupSeconds (${config.maxCatchupSeconds} s) allows ${allowedByTimeOnTheRunner} blocks at the measured ` +
+        `runner rate, fewer than the ${config.maxCatchupBlocks} the block bound allows -- the time bound would decide`,
+    );
+
+    // And the budget must fit inside the job's own `timeout-minutes: 10` together with the
+    // steps that run before it, or a run is killed mid-scan with nothing committed.
+    const JOB_TIMEOUT_SECONDS = 600;
+    const SETUP_SECONDS = 45; // measured from the run log: checkout, tests, record fetch
+    assert.ok(
+      config.maxCatchupSeconds + SETUP_SECONDS < JOB_TIMEOUT_SECONDS,
+      `maxCatchupSeconds (${config.maxCatchupSeconds} s) plus ${SETUP_SECONDS} s of setup must stay inside the ` +
+        `${JOB_TIMEOUT_SECONDS} s job timeout`,
+    );
+
+    // The conversion at the first-run default is what stops a run that has no history, and
+    // it must still outrun one real interval -- a cold run may fall short of the block bound
+    // but it must never lose ground, which is the failure being fixed.
+    const allowedByTimeOnAColdRun = blocksForBudget(config.maxCatchupSeconds * 1000, DEFAULT_SCAN_BLOCKS_PER_SECOND);
+    assert.ok(
+      allowedByTimeOnAColdRun >= blocksPerRealInterval,
+      `at the conservative ${DEFAULT_SCAN_BLOCKS_PER_SECOND} blocks/s the budget allows ${allowedByTimeOnAColdRun} ` +
+        `blocks, fewer than the ${blocksPerRealInterval} a real scheduler interval produces`,
     );
   });
 });
