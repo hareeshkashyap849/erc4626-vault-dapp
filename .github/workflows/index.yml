@@ -1,5 +1,38 @@
 # Index new blocks on a schedule and commit the updated snapshot.
 #
+# THIS CRON RAN 105 TIMES AND SUCCEEDED 105 TIMES LESS THAN THAT. THE RECORD IS HERE
+# BECAUSE A SCHEDULED WORKFLOW THAT FAILS SILENTLY LOOKS EXACTLY LIKE ONE THAT WORKS.
+#
+# Measured 2026-09-17 against the GitHub API, not read off a dashboard: runs #1..#105, all
+# `event=schedule`, `conclusion=failure` for 104 of them and the 105th still queued when it
+# was read and failing immediately after. Zero green runs, and **zero commits ever authored
+# by `github-actions[bot]`** -- `data/vault.sqlite` has five commits and every one is the
+# author's. So the published snapshot sat at block 46,919,979 while the chain head was
+# 46,946,137: about 26,158 blocks, roughly 14.5 hours, stale. Nothing said so, because a
+# failing scheduled workflow notifies nobody by default.
+#
+# Two causes, found in that order:
+#
+#   1. NO SECRET. `RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}` had never been created, so
+#      the variable expanded to the empty string and the indexer stopped at once with
+#      `RpcClient needs a url`. Runs #1..#105 all hit this. (Run #1 also failed one step
+#      earlier, on a 404 for the deployment record, which did not exist yet.)
+#   2. AN UNRETRIED 429. Once the secret existed the run got further and stopped on
+#      `HTTP 429 Too Many Requests` -- on the SECOND request of the run, because a public
+#      endpoint throttles GitHub's shared runner IPs. `src/lib/rpc.ts` treated that like any
+#      other rejection: one retry after 250 ms, then throw. The throw skipped the commit step
+#      below, so a momentary throttle cost a whole snapshot interval.
+#
+# The fix for (2) lives in `src/lib/rpc.ts`: a 429 or a 5xx is now retried with bounded
+# exponential backoff, and any other 4xx still fails on the first attempt, because a 400 is a
+# statement about the request and re-sending it only repeats the answer. The limit is
+# concurrency rather than rate, which is why backing off works: 30 requests at once answer
+# 200, 60 answer 40 x 200 and 20 x 429, and the same endpoint answers again a few seconds later.
+#
+# WHAT THIS COMMENT CANNOT ESTABLISH, AND WHERE TO CHECK IT: whether recent runs are green.
+# The run history is the place. This is the record of what was measured on the date above, not
+# a claim about now.
+#
 # WHY A CRON AND NOT A SERVICE
 #
 # No free hosting tier runs a long-lived process: Render sleeps a web service after

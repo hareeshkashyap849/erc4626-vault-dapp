@@ -15,6 +15,33 @@
  * all, and the documented fallback exists for exactly that. Every other error is
  * thrown, because swallowing them would turn a broken endpoint into silent gaps in
  * the index.
+ *
+ * A RATE LIMIT IS A THIRD CASE, AND IT IS NOT A CAPABILITY FACT.
+ *
+ * This client used to treat every non-2xx alike: one retry after a fixed 250 ms, then
+ * throw. Against a public endpoint that answer is wrong, and it was measured wrong in
+ * production. The scheduled workflow ran 105 times and failed 105 times -- 104 of them
+ * before the RPC URL secret existed, and after that secret was added it still failed,
+ * because the public endpoint throttles GitHub's runner IPs:
+ *
+ *     indexer failed: https://sepolia.base.org: HTTP 429 Too Many Requests
+ *
+ * That 429 arrives on the SECOND request of the run -- `eth_chainId` succeeds and the
+ * next call is refused -- and because the run throws, the workflow's "Commit the
+ * snapshot if it changed" step never executes, so the published snapshot never
+ * advances at all.
+ *
+ * Measured shape of the limit on `sepolia.base.org`, so the backoff below is sized from
+ * a fact rather than from a guess:
+ *
+ *     30 requests concurrently  -> 30 x 200
+ *     60 requests concurrently  -> 40 x 200, 20 x 429   (the ceiling is concurrency, ~40)
+ *     30 requests sequentially  -> 30 x 200             (no per-second limit)
+ *     5 s after a 429, 1/s      -> 20 x 200             (a 429 clears within seconds)
+ *
+ * So a throttled endpoint must be backed off and asked again, not written off. The
+ * distinction is the same one recorded in `docs/优化检查点.md`: a 429 is throttling, a
+ * 5xx is jitter, and only a genuine capability failure is fatal on the first attempt.
  */
 
 export interface BlockHeader {
@@ -25,11 +52,66 @@ export interface BlockHeader {
 }
 
 export interface RpcOptions {
-  /** How many HTTP attempts per call. One retry covers an intermittent failure. */
+  /**
+   * How many HTTP attempts per request. Default 5.
+   *
+   * Not 2 any more: a throttled public endpoint refuses the SAME request that would
+   * succeed a few seconds later, so the number of tries is what decides whether a run
+   * survives a rate limit at all.
+   */
   attempts?: number;
   /** Abort a single HTTP request after this long. */
   timeoutMs?: number;
+  /** Longest single backoff between attempts, in ms. Default 8000. */
+  maxBackoffMs?: number;
   fetchFn?: typeof fetch;
+  /** Injected in tests so backoff can be observed without waiting for it. */
+  sleepFn?: (ms: number) => Promise<void>;
+}
+
+/** How the client should react to a failed HTTP request. */
+export type FailureKind =
+  /** Throttled or temporarily broken: ask again after a backoff. */
+  | 'retry'
+  /** A fact about this endpoint or this request: retrying repeats the same rejection. */
+  | 'fatal';
+
+/**
+ * Decide, from a status code, whether asking again can help.
+ *
+ * 429 is the case this exists for. 5xx is included because a public endpoint answers
+ * those under load, and the correct reaction is the same. Everything else -- a 400, a
+ * 401, a 404 -- is a statement about the request, and re-sending it spends the
+ * catch-up budget to receive the identical rejection.
+ */
+export function classifyHttpFailure(status: number): FailureKind {
+  if (status === 429) return 'retry';
+  if (status >= 500) return 'retry';
+  return 'fatal';
+}
+
+/**
+ * `Retry-After` in seconds, when the endpoint supplies it.
+ *
+ * Providers that send it know better than our backoff curve does. Capped, because a
+ * hostile or mistaken value must not park the run past its own wall-clock bound.
+ */
+export function retryAfterMs(headerValue: string | null, capMs: number): number | null {
+  if (!headerValue) return null;
+  const seconds = Number(headerValue.trim());
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(seconds * 1000, capMs);
+}
+
+/** Thrown for a failed HTTP request, keeping the status so callers can classify it. */
+export class RpcHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, statusText: string) {
+    super(`HTTP ${status}${statusText ? ` ${statusText}` : ''}`);
+    this.name = 'RpcHttpError';
+    this.status = status;
+  }
 }
 
 export class RpcClient {
@@ -37,14 +119,18 @@ export class RpcClient {
   private nextId = 1;
   private readonly attempts: number;
   private readonly timeoutMs: number;
+  private readonly maxBackoffMs: number;
   private readonly fetchFn: typeof fetch;
+  private readonly sleepFn: (ms: number) => Promise<void>;
 
   constructor(url: string, options: RpcOptions = {}) {
     if (!url) throw new Error('RpcClient needs a url');
     this.url = url;
-    this.attempts = options.attempts ?? 2;
+    this.attempts = options.attempts ?? 5;
     this.timeoutMs = options.timeoutMs ?? 20_000;
+    this.maxBackoffMs = options.maxBackoffMs ?? 8_000;
     this.fetchFn = options.fetchFn ?? globalThis.fetch;
+    this.sleepFn = options.sleepFn ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     if (typeof this.fetchFn !== 'function') throw new Error('RpcClient needs a fetch implementation');
   }
 
@@ -114,6 +200,8 @@ export class RpcClient {
     for (let attempt = 1; attempt <= this.attempts; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      /** How long to wait before the next attempt, or null when this attempt did not fail. */
+      let delayMs: number | null = null;
       try {
         const res = await this.fetchFn(this.url, {
           method: 'POST',
@@ -121,19 +209,47 @@ export class RpcClient {
           body: JSON.stringify(body),
           signal: controller.signal,
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-        return await res.json();
+        if (!res.ok) {
+          const failure = new RpcHttpError(res.status, res.statusText);
+          // A rejection is a fact about this request; a throttle is a fact about this
+          // moment. Only the second one is worth asking about again.
+          if (classifyHttpFailure(res.status) === 'fatal') throw failure;
+          const suggested = retryAfterMs(res.headers?.get?.('retry-after') ?? null, this.maxBackoffMs);
+          lastError = failure;
+          delayMs = suggested ?? this.#backoffMs(attempt);
+        } else {
+          return await res.json();
+        }
       } catch (err) {
+        // The response was received and classified: a fatal status is thrown out of the
+        // loop here, and a retryable one arrives with its delay already chosen.
+        if (err instanceof RpcHttpError) throw err;
+        // Anything else is a transport failure -- reset connection, timeout, aborted.
         lastError = err as Error;
-        // A retry only helps for transport failures. Retrying a rejected request
-        // just spends the catch-up budget twice on the same rejection.
-        if (attempt < this.attempts) await new Promise((r) => setTimeout(r, 250 * attempt));
+        delayMs = this.#backoffMs(attempt);
       } finally {
         clearTimeout(timer);
       }
+
+      // Backoff for every retryable outcome, computed once, and skipped on the last
+      // attempt because another would not follow it. The run's wall-clock bound still
+      // applies to the total, so each sleep is bounded.
+      if (delayMs !== null && attempt < this.attempts) await this.sleepFn(delayMs);
     }
 
     throw new Error(`${this.url}: ${lastError?.message ?? 'request failed'}`);
+  }
+
+  /**
+   * Exponential backoff with jitter, capped.
+   *
+   * Jitter is not decoration: several runners throttled by the same endpoint would
+   * otherwise retry in lockstep and throttle each other again at the same instant.
+   * Capped so a run cannot spend its whole wall-clock budget waiting.
+   */
+  #backoffMs(attempt: number): number {
+    const ceiling = Math.min(500 * 2 ** (attempt - 1), this.maxBackoffMs);
+    return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
   }
 
   // ------------------------------------------------------------- chain reads

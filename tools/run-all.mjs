@@ -32,6 +32,10 @@ const CHECKS = [
   // "listed but missing" guard. It covers the real-deployment bug: a public endpoint
   // answers `0x` for a read at the deployment block, which is not zero.
   { name: 'RPC results: "0x" is unknown, never zero', file: 'test/rpc-results.test.ts' },
+  // The throttle bug: a 429 on the second request of a scheduled run threw, which skipped the
+  // workflow's commit step, so the published snapshot never advanced. MEASURED: 105 scheduled
+  // runs, 105 failures, zero bot commits. These tests pin the retry/backoff distinction.
+  { name: 'RPC retry: a 429 is throttling, not a capability fact', file: 'test/rpc-retry.test.ts' },
   { name: 'storage: idempotence and reorg rollback', file: 'test/db.test.ts' },
   { name: 'share price arithmetic', file: 'test/price.test.ts' },
   { name: 'candlestick aggregation and formatting', file: 'test/chart.test.ts' },

@@ -242,7 +242,10 @@ export class Indexer {
     // A run that had nothing to do logs `scanned=0`, which says nothing about the rate;
     // skip those and use the most recent run that actually scanned something.
     const lastRun = this.store.recentLog(50).find((row) => row.event === 'run' && /scanned=[1-9]/.test(row.detail ?? ''));
-    return scanRateFromHistory(lastRun?.detail);
+    // `recentLog` types `detail` as `string | null` -- the column is nullable -- while the parser
+    // takes `string | undefined`. Both mean "no detail recorded", so they are collapsed here rather
+    // than widened in the parser, where the distinction does not exist.
+    return scanRateFromHistory(lastRun?.detail ?? undefined);
   }
 
   /** Index one inclusive range. Idempotent, so re-running it is always safe. */
