@@ -227,7 +227,7 @@ jobs:
         run: |
           mkdir -p deployments
           curl --fail --silent --show-error --location \
-            https://raw.githubusercontent.com/hareeshkashyap849/erc4626-vault/main/deployments/base-sepolia.json \
+            https://raw.githubusercontent.com/wuzilin-web3/erc4626-vault/main/deployments/base-sepolia.json \
             --output deployments/base-sepolia.json
           echo "--- record ---"
           cat deployments/base-sepolia.json
